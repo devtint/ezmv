@@ -1,10 +1,18 @@
 name: Release
 
-# Push a tag like v0.9.1 to publish a release. The tag must match
+# Push a tag like v0.11.0 to publish a release. The tag must match
 # $EzmvVersion in ezmv.ps1, and every CI job must pass first.
+# If a release for the tag already exists (made by hand on GitHub), the
+# files are added to it instead. It can also be started by hand for an
+# existing tag from the Actions tab.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, for example v0.11.0'
+        required: true
 
 jobs:
   ci:
@@ -17,12 +25,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Check that the tag matches the script version
         run: |
           version=$(sed -n "s/^\$EzmvVersion = '\([^']*\)'.*/\1/p" ezmv.ps1)
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           echo "script: $version  tag: $tag"
           if [ "$version" != "$tag" ]; then
             echo "::error::Tag v$tag does not match \$EzmvVersion = '$version' in ezmv.ps1"
@@ -38,7 +50,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          prerelease=""
-          case "$GITHUB_REF_NAME" in v0.*) prerelease="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/ezmv.ps1 dist/ezmv.ps1.sha256 \
-            --title "ezmv ${GITHUB_REF_NAME#v}" --generate-notes $prerelease
+          prerelease=false
+          case "$TAG" in v0.*) prerelease=true ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists: adding the files to it"
+            gh release upload "$TAG" dist/ezmv.ps1 dist/ezmv.ps1.sha256 --clobber
+            gh release edit "$TAG" --prerelease="$prerelease"
+          else
+            flag=""
+            if [ "$prerelease" = true ]; then flag="--prerelease"; fi
+            gh release create "$TAG" dist/ezmv.ps1 dist/ezmv.ps1.sha256 \
+              --title "ezmv ${TAG#v}" --generate-notes $flag
+          fi
