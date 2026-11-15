@@ -1414,6 +1414,7 @@ try {
             $log = Join-Path $logDir ('final_sync_' + $stamp + '.log')
             $code = Copy-Tree ($dL + ':\') $copyRoot $log 0 '' -Mirror
             if ($code -ge 8) { throw ('The final sync reported failures (robocopy code ' + $code + '). See ' + $log + '. Nothing was deleted.') }
+            if ($stg) { try { [System.IO.File]::SetAttributes($stg, [System.IO.FileAttributes]::Directory) } catch { } }
             $check = Test-TreeCopy ($dL + ':\') $copyRoot
             if (-not $check.Ok) {
                 $check.Lines | Select-Object -First 20 | ForEach-Object { Say ('    ' + $_.Trim()) 'Red' }
