@@ -59,3 +59,22 @@ jobs:
           name: ezmv-vhd-logs
           path: ${{ runner.temp }}/ezmv-vhd-test/state/logs
           if-no-files-found: ignore
+
+  test-resilience:
+    name: Crash, rollback and tamper tests (fake BitLocker and WinRE)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run tests\Test-Resilience.ps1
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Resilience.ps1 -WorkDir "$env:RUNNER_TEMP\ezmv-resilience-test" -KeepDisk
+          exit $LASTEXITCODE
+      - name: Upload ezmv logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ezmv-resilience-logs
+          path: ${{ runner.temp }}/ezmv-resilience-test/state/logs
+          if-no-files-found: ignore

@@ -46,6 +46,10 @@
 .PARAMETER StopAfterPhase
     Testing only: stop after the given step (1-9) to simulate an interruption.
 
+.PARAMETER KillAfterPhase
+    Testing only: kill the process right after the given step (1-9) is saved,
+    skipping every clean-up, like a power cut.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\ezmv.ps1 -PlanOnly
 
@@ -63,7 +67,8 @@ param(
     [switch]$Yes,
     [switch]$VerifyHash,
     [string]$StatePath,
-    [int]$StopAfterPhase = 0
+    [int]$StopAfterPhase = 0,
+    [int]$KillAfterPhase = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -474,6 +479,7 @@ $logDir = Join-Path (Split-Path $StatePath -Parent) 'logs'
 function Complete-Phase([int]$Number) {
     $S.Phase = $Number
     Save-State $S $StatePath
+    if ($KillAfterPhase -eq $Number) { Stop-Process -Id $PID -Force }
     if ($StopAfterPhase -eq $Number) { throw ('Stopped after step ' + $Number + ' because of -StopAfterPhase (testing).') }
 }
 
