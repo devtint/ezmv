@@ -15,7 +15,7 @@ jobs:
     name: Lint (PSScriptAnalyzer)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run PSScriptAnalyzer
         shell: powershell
         run: |
@@ -32,7 +32,7 @@ jobs:
     name: File-handling tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run tests\Test-Functions.ps1
         shell: powershell
         run: |
@@ -44,7 +44,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run tests\Test-OnVirtualDisk.ps1
         shell: powershell
         run: |
@@ -54,7 +54,7 @@ jobs:
           exit $LASTEXITCODE
       - name: Upload ezmv logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ezmv-vhd-logs
           path: ${{ runner.temp }}/ezmv-vhd-test/state/logs
