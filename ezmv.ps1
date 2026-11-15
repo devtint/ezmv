@@ -67,8 +67,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$EzmvVersion = '0.9.0'
+$EzmvVersion = '0.9.1'
 $RecoveryGptType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
+$TempLabel = 'ezmv-temp'
+$SidAdmins = 'S-1-5-32-544'
+$SidSystem = 'S-1-5-18'
+
+# Set by the main script (always elevated) so the resume file is written with
+# an Administrators-only ACL. Left off when dot-sourced, so the tests run
+# without admin rights.
+$script:ProtectState = $false
 $IsDotSourced = ($MyInvocation.InvocationName -eq '.')
 
 # robocopy flags (the tests override these so they can run without admin rights)
@@ -359,11 +367,48 @@ function New-DataDrive([int]$DiskNumber, [string]$Letter, [string]$Label, [int64
     return (Get-Partition -DriveLetter $Letter)
 }
 
+# Owner of a file or folder as a SID string.
+function Get-OwnerSid([string]$Path) {
+    return (Get-Acl -LiteralPath $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+function Test-TrustedOwner([string]$Path) {
+    $sid = Get-OwnerSid $Path
+    return ($sid -eq $SidAdmins -or $sid -eq $SidSystem)
+}
+
+# Gives a file or folder an ACL that only Administrators and SYSTEM can use,
+# owned by Administrators. A normal user can then neither read nor change it.
+function Protect-AdminOnly([string]$Path) {
+    $admins = New-Object System.Security.Principal.SecurityIdentifier($SidAdmins)
+    $system = New-Object System.Security.Principal.SecurityIdentifier($SidSystem)
+    $isDir = (Get-Item -LiteralPath $Path -Force).PSIsContainer
+    if ($isDir) {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    } else {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    $prop = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $acl.SetOwner($admins)
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($admins, $full, $inherit, $prop, $allow)))
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system, $full, $inherit, $prop, $allow)))
+    # SetAccessControl writes only the owner and the DACL (Set-Acl can also try
+    # to write the audit list, which needs an extra privilege).
+    (Get-Item -LiteralPath $Path -Force).SetAccessControl($acl)
+}
+
 function Save-State($State, [string]$Path) {
     $dir = Split-Path $Path -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $tmp = $Path + '.tmp'
+    if (Test-Path $tmp) { Remove-Item -Path $tmp -Force }
     $State | ConvertTo-Json -Depth 5 | Set-Content -Path $tmp -Encoding UTF8
+    if ($script:ProtectState) { Protect-AdminOnly $tmp }
     Move-Item -Path $tmp -Destination $Path -Force
 }
 
@@ -420,7 +465,10 @@ $shellSvcStopped = $false
 $winReDisabled = $false
 $transcriptOn = $false
 
-if (-not $StatePath) { $StatePath = Join-Path (Join-Path $env:ProgramData 'ezmv') 'state.json' }
+$defaultStateDir = Join-Path $env:ProgramData 'ezmv'
+$usingDefaultState = (-not $StatePath)
+if ($usingDefaultState) { $StatePath = Join-Path $defaultStateDir 'state.json' }
+$script:ProtectState = $true
 $logDir = Join-Path (Split-Path $StatePath -Parent) 'logs'
 
 function Complete-Phase([int]$Number) {
@@ -432,6 +480,23 @@ function Complete-Phase([int]$Number) {
 try {
     Set-Location ($env:SystemDrive + '\')
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+    # The resume file tells an elevated ezmv which partitions to delete, so it
+    # must not be writable by normal users. %ProgramData% lets any user create
+    # folders, so the default folder is checked and locked down first.
+    if ($usingDefaultState) {
+        if (Test-Path $defaultStateDir) {
+            if (-not (Test-TrustedOwner $defaultStateDir)) {
+                throw ($defaultStateDir + ' is owned by ' + (Get-OwnerSid $defaultStateDir) + ', not by Administrators. Someone else may have created it to tamper with ezmv. Check what is in it, delete it, then run ezmv again.')
+            }
+        } else {
+            New-Item -ItemType Directory -Path $defaultStateDir -Force | Out-Null
+        }
+        Protect-AdminOnly $defaultStateDir
+    }
+    if ((Test-Path $StatePath) -and -not (Test-TrustedOwner $StatePath)) {
+        throw ('The resume file ' + $StatePath + ' is owned by ' + (Get-OwnerSid $StatePath) + ', not by Administrators, so it may have been tampered with. ezmv will not act on it. Check it, delete it if you did not create it, then run ezmv again.')
+    }
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
     try { Start-Transcript -Path (Join-Path $logDir ('session_' + $stamp + '.log')) | Out-Null; $transcriptOn = $true } catch { }
 
@@ -465,6 +530,10 @@ try {
                 Step 'Rolling back'
                 Undo-Early $saved
                 Remove-Item $StatePath -Force
+                # undo what an earlier, interrupted run left suspended (done in finally)
+                $cL = "$($saved.TargetLetter)"
+                if ([bool]$saved.BitLockerSuspended) { $bitLockerSuspended = $true }
+                if ([bool]$saved.WinReDisabled) { $winReDisabled = $true }
                 Say '  Rolled back. The disk is as it was before.' 'Green'
                 Show-Layout ([int]$saved.DiskNumber)
             }
@@ -583,8 +652,9 @@ try {
         if (-not $cBl -and -not $dBl) { Say '  BitLocker status could not be read (continuing).' 'Yellow' }
 
         $winRe = Get-WinReInfo
-        if ($winRe.Enabled -and $winRe.Disk -eq $diskNo) {
-            Say ('  Windows Recovery lives on this disk (partition ' + $winRe.Partition + ') -> disabled during the work, re-enabled at the end')
+        $winReBetween = ($winRe.Enabled -and $winRe.Disk -eq $diskNo -and @($between | Where-Object { [int]$_.PartitionNumber -eq $winRe.Partition }).Count -gt 0)
+        if ($winReBetween) {
+            Say ('  Windows Recovery lives on the partition being removed (partition ' + $winRe.Partition + ') -> disabled during the work, re-enabled at the end')
         } elseif ($between.Count -gt 0) {
             Say '  The recovery partition in between is not in active use by Windows Recovery.'
         }
@@ -688,6 +758,8 @@ try {
             TempOffset     = [int64]0
             BetweenOffsets = @($between | ForEach-Object { [int64]$_.Offset })
             VerifyHash     = [bool]$VerifyHash
+            BitLockerSuspended = $false
+            WinReDisabled  = $false
         }
         Save-State $S $StatePath
     }
@@ -700,6 +772,15 @@ try {
     $used = [int64]$S.Used
     $doHash = ([bool]$S.VerifyHash -or [bool]$VerifyHash)
 
+    # Resume files from 0.9.0 do not have these fields yet.
+    foreach ($f in 'BitLockerSuspended', 'WinReDisabled') {
+        if (-not ($S.PSObject.Properties.Name -contains $f)) { $S | Add-Member -NotePropertyName $f -NotePropertyValue $false }
+    }
+    # If an earlier run suspended BitLocker or disabled Windows Recovery and then
+    # died (power cut, closed window), this run has to undo that at the end.
+    if ([bool]$S.BitLockerSuspended) { $bitLockerSuspended = $true }
+    if ([bool]$S.WinReDisabled) { $winReDisabled = $true }
+
     $svc = Get-Service -Name ShellHWDetection -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -eq 'Running') {
         try { Stop-Service -Name ShellHWDetection -Force; $shellSvcStopped = $true } catch { }
@@ -709,8 +790,10 @@ try {
     try { $cBlNow = Get-BitLockerVolume -MountPoint ($cL + ':') } catch { }
     if ($cBlNow -and "$($cBlNow.ProtectionStatus)" -eq 'On') {
         Step ('Suspending BitLocker on ' + $cL + ':')
-        Suspend-BitLocker -MountPoint ($cL + ':') -RebootCount 0 | Out-Null
+        $S.BitLockerSuspended = $true
+        Save-State $S $StatePath
         $bitLockerSuspended = $true
+        Suspend-BitLocker -MountPoint ($cL + ':') -RebootCount 0 | Out-Null
     }
 
     if ([int]$S.Phase -lt 1) {
@@ -723,7 +806,7 @@ try {
 
     if ([int]$S.Phase -lt 2) {
         Step ('Step 2/10: creating temporary drive ' + $tL + ':')
-        $tPart = New-DataDrive $diskNo $tL $S.DonorLabel ([int64]$S.AllocUnit) ([int64]$S.DonorOffset + [int64]$S.DonorShrunk) ([int64]$S.DonorOffset + [int64]$S.DonorSize)
+        $tPart = New-DataDrive $diskNo $tL $TempLabel ([int64]$S.AllocUnit) ([int64]$S.DonorOffset + [int64]$S.DonorShrunk) ([int64]$S.DonorOffset + [int64]$S.DonorSize)
         $S.TempOffset = [int64]$tPart.Offset
         if ([int64](Get-Volume -DriveLetter $tL).SizeRemaining -le $used) { throw ('The temporary drive is too small for the files on ' + $dL + ':.') }
         Complete-Phase 2
@@ -779,10 +862,16 @@ try {
         $offsets = @($S.BetweenOffsets | ForEach-Object { [int64]$_ })
         if ($offsets.Count -gt 0) {
             $winRe = Get-WinReInfo
+            $rePart = $null
             if ($winRe.Enabled -and $winRe.Disk -eq $diskNo) {
+                $rePart = Get-Layout $diskNo | Where-Object { [int]$_.PartitionNumber -eq $winRe.Partition }
+            }
+            if ($rePart -and ($offsets -contains [int64]$rePart.Offset)) {
                 Step 'Disabling Windows Recovery (re-enabled at the end)'
-                & reagentc.exe /disable | Out-Host
+                $S.WinReDisabled = $true
+                Save-State $S $StatePath
                 $winReDisabled = $true
+                & reagentc.exe /disable | Out-Host
                 $wim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
                 if (-not (Test-Path $wim)) {
                     Say '  The recovery image was not moved to the Windows drive.' 'Yellow'
@@ -894,6 +983,9 @@ finally {
             & reagentc.exe /enable | Out-Host
             if (-not (Get-WinReInfo).Enabled) {
                 Write-Host 'Windows Recovery is still disabled. Run "reagentc /enable" again after a reboot.' -ForegroundColor Yellow
+            } elseif ($S -and (Test-Path $StatePath)) {
+                $S.WinReDisabled = $false
+                try { Save-State $S $StatePath } catch { }
             }
         } catch {
             Write-Host ('Could not re-enable Windows Recovery: ' + $_.Exception.Message) -ForegroundColor Yellow
@@ -903,6 +995,10 @@ finally {
         try {
             Resume-BitLocker -MountPoint ($cL + ':') | Out-Null
             Write-Host ('BitLocker on ' + $cL + ': resumed.')
+            if ($S -and (Test-Path $StatePath)) {
+                $S.BitLockerSuspended = $false
+                try { Save-State $S $StatePath } catch { }
+            }
         } catch {
             Write-Host ('Could not resume BitLocker on ' + $cL + ': - run:  Resume-BitLocker -MountPoint ' + $cL + ':') -ForegroundColor Yellow
         }

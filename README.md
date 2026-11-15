@@ -2,7 +2,7 @@
 
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
-> **Status: beta (0.9.0).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. Not yet exercised by a test: suspending and resuming BitLocker, moving Windows Recovery, and the roll-back path. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
+> **Status: beta (0.9.1).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. Not yet exercised by a test: suspending and resuming BitLocker, moving Windows Recovery, and the roll-back path. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
 
 ## The problem
 
@@ -86,13 +86,13 @@ ezmv then:
 
 | Situation | What ezmv does |
 |---|---|
-| BitLocker **on** for the target drive | Suspends protection during the work, resumes it at the end (even if the run fails) |
+| BitLocker **on** for the target drive | Suspends protection during the work, resumes it at the end (even if the run fails; after a crash or power cut, the next run resumes it) |
 | BitLocker **off**, or not available on this edition | Nothing to do, continues normally |
 | BitLocker already suspended | Leaves it as it is |
 | BitLocker on for the data drive | Works, but warns that the recreated drive is not encrypted until you turn it on again |
 | BitLocker still encrypting / decrypting | Stops and asks you to wait |
 | Data drive locked by BitLocker | Stops and asks you to unlock it |
-| Windows Recovery lives on the partition being removed | Disables it first (moves the image to the Windows drive), re-enables it at the end |
+| Windows Recovery lives on the partition being removed | Disables it first (moves the image to the Windows drive), re-enables it at the end (after a crash, the next run re-enables it) |
 | No Recovery partition between the drives | Skips that step |
 | Something other than a Recovery partition between the drives | Stops |
 | Page file on the data drive | Stops and tells you how to move it |
@@ -113,6 +113,10 @@ After every step ezmv saves its progress to a resume file. If the run stops for 
 - **Stopped during steps 9-10:** your files are back on the data drive; ezmv only needs to finish tidying up.
 
 Logs are written to `%ProgramData%\ezmv\logs`.
+
+The resume file decides which partitions an elevated ezmv deletes, so ezmv keeps `%ProgramData%\ezmv` readable and writable by Administrators and SYSTEM only, and refuses to act on a resume file (or a default folder) owned by anyone else.
+
+The temporary drive is labelled `ezmv-temp`, so it is easy to tell apart from the data drive.
 
 ## What you lose
 
