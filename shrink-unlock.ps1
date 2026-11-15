@@ -114,7 +114,7 @@ function Get-ShrinkInfo([string]$L) {
         Size      = $size
         Free      = [int64]$v.SizeRemaining
         MinSize   = $min
-        MaxShrink = [int64]([math]::Max(0, $size - $min))
+        MaxShrink = [int64]([math]::Max([int64]0, [int64]($size - $min)))
     }
 }
 
