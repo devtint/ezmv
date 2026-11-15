@@ -60,8 +60,12 @@ function Invoke-Ezmv([string[]]$EzmvArgs, [string]$Answers = '') {
     $env:EZMV_FAKE_ANSWERS = $Answers
     $quoted = @($EzmvArgs | ForEach-Object { if ($_ -like '-*') { $_ } else { "'" + $_.Replace("'", "''") + "'" } })
     $cmd = ". '" + $fakes + "'; `$global:LASTEXITCODE = 0; & '" + $ezmv + "' " + ($quoted -join ' ') + "; exit `$LASTEXITCODE"
+    # ezmv's error output must not stop this test script, so it is collected
+    # as text with errors set to Continue
+    $ErrorActionPreference = 'Continue'
     $out = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | ForEach-Object { "$_" })
     $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
     $out | ForEach-Object { Write-Host ('    | ' + $_) -ForegroundColor DarkGray }
     return New-Object psobject -Property @{ Code = $code; Text = ($out -join "`n") }
 }
@@ -86,7 +90,9 @@ function Test-NewRecovery([string]$Tag) {
     $tEnd = [int64]$t.Offset + [int64]$t.Size
     Check ($Tag + ': it sits right after the target') (([int64]$rec.Offset - $tEnd) -ge 0 -and ([int64]$rec.Offset - $tEnd) -lt 1MB)
     Check ($Tag + ': it is at least 1 GB') ([int64]$rec.Size -ge 1GB)
-    Check ($Tag + ': it is hidden (no drive letter, none assigned later)') ((-not (Get-Letter $rec)) -and [bool]$rec.NoDefaultDriveLetter)
+    $attr = Get-GptAttributes $diskNo ([int]$rec.PartitionNumber)
+    Check ($Tag + ': it has no drive letter') (-not (Get-Letter $rec))
+    Check ($Tag + ': GPT attributes are required + no drive letter (' + $attr + ')') ($attr -eq '8000000000000001')
     $fs = ''
     try { $fs = "$((Get-Volume -Partition $rec -ErrorAction Stop).FileSystem)" } catch { }
     Check ($Tag + ': it is formatted NTFS') ($fs -eq 'NTFS')

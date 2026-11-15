@@ -419,7 +419,22 @@ function New-RecoveryPartition([int]$DiskNumber, [int64]$Offset, [int64]$Size) {
     Remove-Item $dp -Force -ErrorAction SilentlyContinue
     $p = Get-Layout $DiskNumber | Where-Object { [int64]$_.Offset -eq $Offset }
     if (-not $p -or "$($p.GptType)".ToLower() -ne $RecoveryGptType) { throw 'Could not mark the new partition as a recovery partition.' }
+    $attr = Get-GptAttributes $DiskNumber ([int]$p.PartitionNumber)
+    if ($attr -ne '8000000000000001') {
+        Say ('  The recovery partition attributes are ' + $attr + ' instead of 8000000000000001 (required, no drive letter).') 'Yellow'
+    }
     return $p
+}
+
+# GPT attributes of a partition as a hex string (for example 8000000000000001),
+# read from diskpart because Get-Partition does not show them all.
+function Get-GptAttributes([int]$DiskNumber, [int]$PartitionNumber) {
+    $dp = Join-Path $env:TEMP 'ezmv-diskpart-detail.txt'
+    Set-Content -Path $dp -Encoding ASCII -Value @(('select disk ' + $DiskNumber), ('select partition ' + $PartitionNumber), 'detail partition')
+    $out = (& diskpart.exe /s $dp | Out-String)
+    Remove-Item $dp -Force -ErrorAction SilentlyContinue
+    if ($out -match 'Attrib\s*:\s*0[xX]([0-9A-Fa-f]+)') { return $Matches[1].ToUpper().PadLeft(16, '0') }
+    return ''
 }
 
 # Deletes a folder tree, including files whose permissions deny access (backup
@@ -534,7 +549,7 @@ function Undo-Early($State) {
     }
     Update-HostStorageCache
     $max = [int64](Get-PartitionSupportedSize -DriveLetter $State.DonorLetter).SizeMax
-    if ($max -gt [int64](Get-Partition -DriveLetter $State.DonorLetter).Size) {
+    if ($max - [int64](Get-Partition -DriveLetter $State.DonorLetter).Size -ge 1MB) {
         Resize-Partition -DriveLetter $State.DonorLetter -Size $max
     }
 }
@@ -1143,7 +1158,7 @@ try {
         Step ('Step 10/10: growing ' + $dL + ':')
         Update-HostStorageCache
         $dMax = [int64](Get-PartitionSupportedSize -DriveLetter $dL).SizeMax
-        if ($dMax -gt [int64](Get-Partition -DriveLetter $dL).Size) {
+        if ($dMax - [int64](Get-Partition -DriveLetter $dL).Size -ge 1MB) {
             Resize-Partition -DriveLetter $dL -Size $dMax
         }
         Complete-Phase 10
