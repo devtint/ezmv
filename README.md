@@ -137,6 +137,28 @@ The temporary drive is labelled `ezmv-temp`, so it is easy to tell apart from th
 - BitLocker encryption on the data drive, until you turn it on again. During the run, files are written to drives that are not encrypted yet.
 - Nothing on the Recovery partition between the two drives except Windows Recovery, which moves to a new hidden recovery partition
 
+## Drive will not shrink? (`shrink-unlock.ps1`)
+
+Windows can only shrink a drive up to the last file it cannot move, so a drive with 45 GB free can still be limited to a few MB. On the Windows drive that file is usually the page file, the hibernation file, the memory dump or a restore point.
+
+`shrink-unlock.ps1` is a small interactive menu that deals with this:
+
+| Menu | What it does |
+|---|---|
+| 1 Check | How much the drive can shrink now, what is in the way, and the last unmovable file (from event 259) |
+| 2 Unlock | Saves your current settings, turns off hibernation, the page file, the memory dump and System Restore for the drive, deletes its restore points, then restarts. The script opens again by itself after the restart |
+| 3 Shrink | Runs `defrag /X` to consolidate free space, shows the new limit and shrinks by the GB you choose |
+| 4 Restore | Turns every saved setting back on |
+
+```powershell
+irm https://raw.githubusercontent.com/devtint/ezmv/main/shrink-unlock.ps1 -OutFile "$env:USERPROFILE\shrink-unlock.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\shrink-unlock.ps1"
+```
+
+Options: `-Drive C` to skip the drive question, `-Restore` to only turn the saved settings back on.
+
+Deleted restore points cannot be brought back. If the last unmovable file is NTFS metadata (`$MFT`, `$LogFile`, `$Extend\...`), Windows cannot move it while running; use an offline partition tool booted from USB for more room.
+
 ## Tests
 
 ```powershell
