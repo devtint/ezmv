@@ -116,7 +116,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$EzmvVersion = '0.11.1'
+$EzmvVersion = '0.11.2'
 $RecoveryGptType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
 $TempLabel = 'ezmv-temp'
 $RecoveryLabel = 'Windows RE tools'
@@ -366,6 +366,32 @@ function Get-WinReInfo {
     return $info
 }
 
+# Windows 11 Device Encryption encrypts every new volume on its own, and
+# Windows Recovery cannot be enabled on an encrypted partition. This turns
+# BitLocker off on the recovery partition (by its volume GUID path, which
+# works when its drive letter does not) and waits until it is decrypted.
+function Unprotect-RecoveryVolume([int]$DiskNumber, [int]$PartitionNumber) {
+    $p = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
+    $vol = $null
+    try { $vol = Get-Volume -Partition $p -ErrorAction Stop } catch { }
+    if (-not $vol -or -not "$($vol.Path)") { return }
+    $path = "$($vol.Path)"
+    $bl = $null
+    try { $bl = Get-BitLockerVolume -MountPoint $path -ErrorAction Stop } catch { }
+    if (-not $bl -or "$($bl.VolumeStatus)" -eq 'FullyDecrypted') { return }
+    Say ('  The recovery partition was encrypted by Windows (' + $bl.VolumeStatus + '); decrypting it, Windows Recovery cannot live on an encrypted partition') 'Yellow'
+    & manage-bde.exe -off $path | Out-Null
+    $deadline = (Get-Date).AddMinutes(10)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        $bl = $null
+        try { $bl = Get-BitLockerVolume -MountPoint $path -ErrorAction Stop } catch { }
+        # once BitLocker is removed the volume is no longer listed at all
+        if (-not $bl -or "$($bl.VolumeStatus)" -eq 'FullyDecrypted') { Say '  recovery partition decrypted' 'Green'; return }
+    }
+    throw 'The recovery partition is still being decrypted after 10 minutes. Wait, then run ezmv with -FixRecovery.'
+}
+
 # Puts the Windows Recovery image on a given recovery partition and enables
 # it there. Plain "reagentc /enable" can pick the BitLocker-encrypted Windows
 # drive instead (and then refuses), so the location is set explicitly, as in
@@ -387,6 +413,7 @@ function Install-WinReOn([int]$DiskNumber, [int]$PartitionNumber) {
         $dir = $letter + ':\Recovery\WindowsRE'
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         Copy-Item -LiteralPath $wim -Destination (Join-Path $dir 'Winre.wim') -Force
+        Unprotect-RecoveryVolume $DiskNumber $PartitionNumber
         & reagentc.exe /setreimage /path $dir /target $env:SystemRoot | Out-Host
         $bl = $null
         try { $bl = Get-BitLockerVolume -MountPoint $os } catch { }

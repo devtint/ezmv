@@ -6,7 +6,7 @@ Website: https://devtint.github.io/ezmv/
 
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
-> **Status: beta (0.11.1).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
+> **Status: beta (0.11.2).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
 
 ## The problem
 
@@ -196,6 +196,10 @@ These are known and accepted for the beta:
 - **`-StatePath` is for tests and advanced use.** ezmv locks the folder it names to Administrators, but not the folders above it. The default location is fully protected.
 - **Size check margin.** The new data drive must hold the measured copy plus 3% and 256 MB. Alternate data streams and file system overhead are covered by that margin, not measured exactly.
 - **Windows Recovery and BitLocker are tested with fakes in CI.** Their real behaviour, including which partition `reagentc /enable` picks when there are two recovery partitions, still needs testing on real machines.
+
+## Device Encryption (Windows 11 Home)
+
+Device Encryption encrypts every new volume on its own, including the new data drive and the new recovery partition. Windows Recovery cannot be enabled on an encrypted partition, so ezmv decrypts the recovery partition (only that one) before enabling Recovery. The new data drive is left to Windows to encrypt. If Windows Recovery is ever found disabled again, run ezmv with `-FixRecovery`.
 
 ## Disclaimer
 
