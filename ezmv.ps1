@@ -559,7 +559,7 @@ try {
 
         $battery = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
         if ($battery.Count -gt 0 -and @(1, 4, 5) -contains [int]$battery[0].BatteryStatus) {
-            Say '  The computer is running on battery. A power cut slows things down and risks data.' 'Yellow'
+            Say '  The computer is running on battery. If it runs out mid-copy the run stops and has to be resumed.' 'Yellow'
             if (-not $PlanOnly -and -not (Ask-YesNo '  Continue on battery anyway?')) { throw 'Stopped: plug in the charger and run again.' }
         } else {
             Say '  power: ok'

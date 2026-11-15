@@ -2,7 +2,7 @@
 
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
-> **Status: beta (0.9.0).** The file copy, verification and resume-file code is covered by an automated test that passes. The partition steps have a virtual-disk test in this repo, but they have not yet been proven on a wide range of real machines. Back up anything you cannot afford to lose, and try `-PlanOnly` first.
+> **Status: beta (0.9.0).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. Not yet exercised by a test: suspending and resuming BitLocker, moving Windows Recovery, and the roll-back path. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
 
 ## The problem
 
