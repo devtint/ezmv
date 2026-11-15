@@ -6,7 +6,7 @@ Website: https://devtint.github.io/ezmv/
 
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
-> **Status: beta (0.11.0).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
+> **Status: beta (0.11.1).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
 
 ## The problem
 
@@ -88,6 +88,7 @@ ezmv then:
 | `-StagingPath E:\ezmv-staging` | Keep the temporary copy in this folder on another NTFS drive instead of on a temporary partition. Lifts the half-full limit |
 | `-FromFreeSpace` | The space after the target is already free (you deleted D: and Recovery yourself). Asks how much to add to the target, then builds target, a hidden 1 GB recovery partition, and a new data drive with the rest. No files are copied |
 | `-DataLetter E` / `-DataLabel Data` | With `-FromFreeSpace`: letter and name of the new data drive (default D, Data) |
+| `-FixRecovery` | Repair only: when Windows Recovery is off and `reagentc /enable` fails (for example with BitLocker on), puts the recovery image on the recovery partition after the Windows drive and enables it there |
 | `-NoRecoveryPartition` | Do not create a new recovery partition; keep Windows Recovery on the Windows drive |
 
 ## What it detects and handles for you

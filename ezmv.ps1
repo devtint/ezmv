@@ -64,6 +64,12 @@
 .PARAMETER DataLabel
     With -FromFreeSpace: name for the new data drive. Default: Data.
 
+.PARAMETER FixRecovery
+    Repair mode: when Windows Recovery is disabled and cannot be enabled (for
+    example "Windows RE cannot be enabled on a volume with BitLocker Drive
+    Encryption enabled"), puts the recovery image on the recovery partition
+    right after the Windows drive and enables it there. Changes no partitions.
+
 .PARAMETER NoRecoveryPartition
     When the partition Windows Recovery lives on is removed, ezmv normally
     creates a new, hidden recovery partition (at least 1 GB) right after the
@@ -101,6 +107,7 @@ param(
     [string]$StagingPath,
     [switch]$NoRecoveryPartition,
     [switch]$FromFreeSpace,
+    [switch]$FixRecovery,
     [string]$DataLetter,
     [string]$DataLabel = 'Data',
     [int]$StopAfterPhase = 0,
@@ -109,7 +116,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$EzmvVersion = '0.11.0'
+$EzmvVersion = '0.11.1'
 $RecoveryGptType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
 $TempLabel = 'ezmv-temp'
 $RecoveryLabel = 'Windows RE tools'
@@ -357,6 +364,41 @@ function Get-WinReInfo {
         $info.Partition = [int]$Matches[2]
     }
     return $info
+}
+
+# Puts the Windows Recovery image on a given recovery partition and enables
+# it there. Plain "reagentc /enable" can pick the BitLocker-encrypted Windows
+# drive instead (and then refuses), so the location is set explicitly, as in
+# Microsoft's manual steps. BitLocker protection is paused only around the
+# enable, with -RebootCount 1 so it comes back by itself even if ezmv dies.
+function Install-WinReOn([int]$DiskNumber, [int]$PartitionNumber) {
+    $wim = Get-WinReImagePath
+    if (-not (Test-Path -LiteralPath $wim)) {
+        Say ('  The recovery image was not found at ' + $wim + '; trying a plain enable.') 'Yellow'
+        & reagentc.exe /enable | Out-Host
+        return
+    }
+    $os = $env:SystemDrive
+    $letter = Get-FreeLetter
+    Invoke-DiskPart @(('select disk ' + $DiskNumber), ('select partition ' + $PartitionNumber), ('assign letter=' + $letter)) | Out-Null
+    Start-Sleep -Seconds 2
+    $paused = $false
+    try {
+        $dir = $letter + ':\Recovery\WindowsRE'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Copy-Item -LiteralPath $wim -Destination (Join-Path $dir 'Winre.wim') -Force
+        & reagentc.exe /setreimage /path $dir /target $env:SystemRoot | Out-Host
+        $bl = $null
+        try { $bl = Get-BitLockerVolume -MountPoint $os } catch { }
+        if ($bl -and "$($bl.ProtectionStatus)" -eq 'On') {
+            Suspend-BitLocker -MountPoint $os -RebootCount 1 | Out-Null
+            $paused = $true
+        }
+        & reagentc.exe /enable | Out-Host
+    } finally {
+        if ($paused) { try { Resume-BitLocker -MountPoint $os | Out-Null } catch { Say ('  Run: Resume-BitLocker -MountPoint ' + $os) 'Yellow' } }
+        Invoke-DiskPart @(('select disk ' + $DiskNumber), ('select partition ' + $PartitionNumber), ('remove letter=' + $letter)) | Out-Null
+    }
 }
 
 # Runs diskpart commands through standard input. No script file is written,
@@ -758,6 +800,38 @@ try {
 
     # ---- unfinished run? ---------------------------------------------------
     $saved = Read-State $StatePath
+
+    # ---- -FixRecovery: repair Windows Recovery only ---------------------------
+    if ($FixRecovery) {
+        if ($saved -and [int]$saved.Phase -lt 10) { throw 'An ezmv run is not finished yet. Start ezmv again to finish it, then use -FixRecovery.' }
+        Step 'Repairing Windows Recovery'
+        $osP = Get-Partition -DriveLetter $env:SystemDrive.TrimEnd(':')
+        $dno = [int]$osP.DiskNumber
+        $wr = Get-WinReInfo
+        $recs = @(Get-Layout $dno | Where-Object { "$($_.GptType)".ToLower() -eq $RecoveryGptType })
+        if ($wr.Enabled -and $wr.Disk -eq $dno -and @($recs | Where-Object { [int]$_.PartitionNumber -eq $wr.Partition }).Count -gt 0) {
+            Say ('  Windows Recovery is already enabled on recovery partition ' + $wr.Partition + '. Nothing to do.') 'Green'
+        } else {
+            if ($recs.Count -eq 0) { throw ('There is no recovery partition on disk ' + $dno + '. Create one first (for example with -FromFreeSpace).') }
+            $osEnd = [int64]$osP.Offset + [int64]$osP.Size
+            $pick = $recs | Where-Object { [int64]$_.Offset -ge $osEnd } | Sort-Object { [int64]$_.Offset } | Select-Object -First 1
+            if (-not $pick) { $pick = $recs | Sort-Object { [int64]$_.Size } -Descending | Select-Object -First 1 }
+            Say ('  Using recovery partition ' + $pick.PartitionNumber + ' (' + (ToGB $pick.Size) + ' GB) on disk ' + $dno)
+            if ($PlanOnly) { Say 'PLAN ONLY mode: stopping here. Nothing was changed.' 'Yellow'; return }
+            if ($wr.Enabled) { & reagentc.exe /disable | Out-Host }
+            Install-WinReOn $dno ([int]$pick.PartitionNumber)
+            $wr = Get-WinReInfo
+            if (-not $wr.Enabled) { throw 'Windows Recovery could not be enabled. See the reagentc message above.' }
+            Say ('  Windows Recovery is enabled: disk ' + $wr.Disk + ', partition ' + $wr.Partition) 'Green'
+        }
+        if ($saved) {
+            $saved.WinReDisabled = $false
+            Save-State $saved $StatePath
+            if ([bool]$saved.BitLockerSuspended) { $cL = "$($saved.TargetLetter)"; $bitLockerSuspended = $true }
+        }
+        return
+    }
+
     if ($saved -and -not $PlanOnly) {
         # Clean-up an earlier run still owes (it may have died before doing
         # it). It happens in finally, whatever this run does next.
@@ -1638,17 +1712,25 @@ finally {
         Write-Host ''
         Write-Host '==> Re-enabling Windows Recovery' -ForegroundColor Cyan
         try {
-            & reagentc.exe /enable | Out-Host
+            $recP0 = $null
+            if ($cs -and [bool]$cs.RecreateRecovery -and [int64]$cs.RecoveryOffset -gt 0 -and [int]$cs.Phase -ge 7) {
+                $recP0 = Get-Layout ([int]$cs.DiskNumber) | Where-Object { [int64]$_.Offset -eq [int64]$cs.RecoveryOffset }
+            }
+            if ($recP0) {
+                Install-WinReOn ([int]$cs.DiskNumber) ([int]$recP0.PartitionNumber)
+            } else {
+                & reagentc.exe /enable | Out-Host
+            }
             $reNow = Get-WinReInfo
             if (-not $reNow.Enabled) {
-                Write-Host 'Windows Recovery is still disabled. Run "reagentc /enable" again after a reboot.' -ForegroundColor Yellow
+                Write-Host 'Windows Recovery is still disabled. Run ezmv with -FixRecovery to repair it.' -ForegroundColor Yellow
             } else {
                 if ($cs -and [bool]$cs.RecreateRecovery -and [int64]$cs.RecoveryOffset -gt 0 -and [int]$cs.Phase -ge 7) {
                     $recP = Get-Layout ([int]$cs.DiskNumber) | Where-Object { [int64]$_.Offset -eq [int64]$cs.RecoveryOffset }
                     if ($recP -and $reNow.Disk -eq [int]$cs.DiskNumber -and $reNow.Partition -eq [int]$recP.PartitionNumber) {
                         Write-Host ('Windows Recovery is enabled on the new recovery partition (partition ' + $recP.PartitionNumber + ').') -ForegroundColor Green
                     } else {
-                        Write-Host 'Windows Recovery is enabled, but not on the new recovery partition. To move it there, run "reagentc /disable" and then "reagentc /enable".' -ForegroundColor Yellow
+                        Write-Host 'Windows Recovery is enabled, but not on the new recovery partition. Run ezmv with -FixRecovery to move it there.' -ForegroundColor Yellow
                     }
                 }
                 if ($cs -and (Test-Path $StatePath)) {

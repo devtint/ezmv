@@ -77,6 +77,7 @@ function global:Invoke-FakeReAgentC {
             Remove-Item -LiteralPath $global:EzmvWinReImage -Force -ErrorAction SilentlyContinue
             Add-FakeCall 'reagentc /enable'; 'REAGENTC.EXE: Operation Successful.'
         }
+        '/setreimage' { Add-FakeCall ('reagentc /setreimage ' + ($args -join ' ')); 'REAGENTC.EXE: Operation Successful.' }
         default    { throw ('fake reagentc: unexpected arguments ' + ($args -join ' ')) }
     }
 }
