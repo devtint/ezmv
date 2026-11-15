@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ezmv: give D: space to C: on Windows</title>
+<meta name="description" content="Move free space from D: to C: on Windows when Disk Management says you can't. Built-in tools only, files kept.">
+<meta name="color-scheme" content="light">
+<style>
+  :root {
+    --bg: #faf9f5;
+    --surface: #ffffff;
+    --ink: #141413;
+    --muted: #6b6a65;
+    --line: #e8e6dc;
+    --clay: #d97757;
+    --clay-soft: #f4ddd3;
+    --sage: #7d9a84;
+    --sage-soft: #dfe8e1;
+    --stone: #c9c6ba;
+    --code: #f0eee6;
+    --radius: 14px;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.6 var(--sans);
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+  a { color: inherit; }
+
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 28px 0; }
+  .logo { font: 600 20px var(--serif); text-decoration: none; letter-spacing: -0.01em; }
+  .logo span { color: var(--clay); }
+  nav .links a { color: var(--muted); text-decoration: none; font-size: 15px; margin-left: 22px; }
+  nav .links a:hover { color: var(--ink); }
+
+  header { padding: 56px 0 40px; }
+  h1 {
+    font: 500 clamp(36px, 7vw, 54px)/1.1 var(--serif);
+    letter-spacing: -0.02em;
+    margin: 0 0 18px;
+  }
+  h1 em { font-style: normal; color: var(--clay); }
+  .lead { color: var(--muted); font-size: 19px; margin: 0 0 32px; max-width: 34em; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+  .btn {
+    display: inline-block;
+    padding: 11px 20px;
+    border-radius: 999px;
+    font-size: 15px;
+    font-weight: 500;
+    text-decoration: none;
+    border: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .btn.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .btn:hover { border-color: var(--ink); }
+
+  section { padding: 44px 0; border-top: 1px solid var(--line); }
+  h2 { font: 500 26px/1.2 var(--serif); margin: 0 0 22px; letter-spacing: -0.01em; }
+  .kicker { font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--clay); margin: 0 0 8px; }
+
+  /* disk diagram */
+  .disk { margin: 0 0 18px; }
+  .disk .label { font-size: 14px; color: var(--muted); margin-bottom: 8px; }
+  .bar {
+    display: flex;
+    height: 52px;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    background: var(--surface);
+  }
+  .seg {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden;
+    border-right: 2px solid var(--bg);
+  }
+  .seg:last-child { border-right: 0; }
+  .efi { flex: 0 0 7%; background: var(--stone); color: var(--ink); font-size: 11px; }
+  .c { background: var(--clay-soft); color: #8a3f24; }
+  .c.big { background: var(--clay); color: #fff; }
+  .rec { flex: 0 0 9%; background: repeating-linear-gradient(135deg, #e5e2d7 0 6px, #d8d4c7 6px 12px); color: var(--muted); font-size: 11px; }
+  .d { background: var(--sage-soft); color: #3f5a46; }
+  .note { font-size: 15px; color: var(--muted); margin: 6px 0 0; }
+  .note b { color: var(--ink); font-weight: 600; }
+
+  /* steps */
+  ol.steps { list-style: none; padding: 0; margin: 0; counter-reset: s; }
+  ol.steps li { counter-increment: s; position: relative; padding-left: 44px; margin-bottom: 26px; }
+  ol.steps li::before {
+    content: counter(s);
+    position: absolute; left: 0; top: 0;
+    width: 28px; height: 28px; border-radius: 50%;
+    background: var(--clay-soft); color: #8a3f24;
+    font-size: 14px; font-weight: 600;
+    display: flex; align-items: center; justify-content: center;
+  }
+  ol.steps p { margin: 0 0 10px; }
+  .code {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--code);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px 8px 8px 16px;
+  }
+  .code code {
+    flex: 1;
+    min-width: 0;
+    font: 13.5px/1.55 var(--mono);
+    overflow-x: auto;
+    white-space: pre;
+    padding: 6px 0;
+  }
+  .copy {
+    flex: none;
+    font: 500 12px var(--sans);
+    padding: 5px 10px;
+    border-radius: 7px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .copy:hover { color: var(--ink); border-color: var(--stone); }
+
+  /* features */
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .card h3 { font: 600 16px var(--sans); margin: 0 0 6px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--clay); margin-bottom: 14px; }
+
+  ul.req { margin: 0; padding: 0; list-style: none; }
+  ul.req li { padding: 10px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 16px; font-size: 15px; }
+  ul.req li:last-child { border-bottom: 0; }
+  ul.req span:last-child { color: var(--muted); text-align: right; }
+
+  .warn {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--clay);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 15px;
+    color: var(--muted);
+    margin-top: 22px;
+  }
+
+  footer { padding: 36px 0 56px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 520px) {
+    body { font-size: 16px; }
+    header { padding: 28px 0 32px; }
+    nav .links a { margin-left: 14px; }
+    .seg { font-size: 12px; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav>
+    <a class="logo" href="./">ez<span>mv</span></a>
+    <div class="links">
+      <a href="#use">Use</a>
+      <a href="https://github.com/devtint/ezmv/releases">Releases</a>
+      <a href="https://github.com/devtint/ezmv">GitHub</a>
+    </div>
+  </nav>
+
+  <header>
+    <h1>Give <em>D:</em> space to <em>C:</em></h1>
+    <p class="lead">For when Disk Management says no. One PowerShell script, built-in Windows tools, your files kept.</p>
+    <div class="actions">
+      <a class="btn primary" href="#use">Get started</a>
+      <a class="btn" href="https://github.com/devtint/ezmv">View on GitHub</a>
+    </div>
+  </header>
+
+  <section>
+    <p class="kicker">The problem</p>
+    <h2>C: can't grow into D:</h2>
+    <div class="disk">
+      <div class="label">Before</div>
+      <div class="bar">
+        <div class="seg efi">EFI</div>
+        <div class="seg c" style="flex: 0 0 34%">C:</div>
+        <div class="seg rec">Rec</div>
+        <div class="seg d" style="flex: 1">D:</div>
+      </div>
+    </div>
+    <div class="disk">
+      <div class="label">After ezmv</div>
+      <div class="bar">
+        <div class="seg efi">EFI</div>
+        <div class="seg c big" style="flex: 0 0 52%">C: +10 GB</div>
+        <div class="seg d" style="flex: 1">D:</div>
+      </div>
+    </div>
+    <p class="note">ezmv moves the <b>files</b>, not the partition: copy, verify, recreate, copy back.</p>
+  </section>
+
+  <section id="use">
+    <p class="kicker">Use</p>
+    <h2>Three commands</h2>
+    <ol class="steps">
+      <li>
+        <p>Download to your C: drive</p>
+        <div class="code"><code>irm https://raw.githubusercontent.com/devtint/ezmv/main/ezmv.ps1 -OutFile "$env:USERPROFILE\ezmv.ps1"</code></div>
+      </li>
+      <li>
+        <p>See the plan. Changes nothing.</p>
+        <div class="code"><code>powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ezmv.ps1" -PlanOnly</code></div>
+      </li>
+      <li>
+        <p>Run it and follow the prompts</p>
+        <div class="code"><code>powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ezmv.ps1"</code></div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <p class="kicker">Why it is safe</p>
+    <h2>Careful by design</h2>
+    <div class="grid">
+      <div class="card"><div class="dot"></div><h3>Verified copies</h3><p>Nothing is deleted until every file is checked. SHA-256 optional.</p></div>
+      <div class="card"><div class="dot"></div><h3>Survives a power cut</h3><p>Progress is saved after each step. Run it again to resume.</p></div>
+      <div class="card"><div class="dot"></div><h3>Asks first</h3><p>Type YES to start and DELETE before the old drive goes.</p></div>
+      <div class="card"><div class="dot"></div><h3>Handles BitLocker</h3><p>Suspends and resumes it. Moves Windows Recovery if needed.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="kicker">Requirements</p>
+    <h2>Before you start</h2>
+    <ul class="req">
+      <li><span>Windows</span><span>10 or 11</span></li>
+      <li><span>Disk</span><span>GPT, D: right after C:</span></li>
+      <li><span>D: drive</span><span>NTFS, under half full</span></li>
+      <li><span>Rights</span><span>Administrator</span></li>
+    </ul>
+    <div class="warn">Beta. Back up anything you can't lose, and run with -PlanOnly first.</div>
+  </section>
+
+  <footer>
+    <span>ezmv, MIT license</span>
+    <span><a href="https://github.com/devtint">devtint</a></span>
+  </footer>
+
+</div>
+<script>
+  document.querySelectorAll('.code').forEach(function (box) {
+    var text = box.querySelector('code').textContent;
+    var b = document.createElement('button');
+    b.className = 'copy';
+    b.type = 'button';
+    b.textContent = 'Copy';
+    b.addEventListener('click', function () {
+      var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {});
+      }
+    });
+    box.appendChild(b);
+  });
+</script>
+</body>
+</html>

@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/devtint/ezmv/actions/workflows/ci.yml/badge.svg)](https://github.com/devtint/ezmv/actions/workflows/ci.yml)
 
+Website: https://devtint.github.io/ezmv/
+
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
 > **Status: beta (0.9.1).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
