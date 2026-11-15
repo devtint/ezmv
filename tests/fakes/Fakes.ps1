@@ -9,6 +9,10 @@
 #>
 $global:FakeStatePath = $env:EZMV_FAKE_STATE
 
+# The Windows Recovery image "on the Windows drive": like the real one it
+# appears there when Recovery is disabled and leaves when it is enabled.
+$global:EzmvWinReImage = Join-Path (Split-Path $env:EZMV_FAKE_STATE -Parent) 'Winre.wim'
+
 function global:Read-FakeState { Get-Content -LiteralPath $global:FakeStatePath -Raw | ConvertFrom-Json }
 function global:Write-FakeState($State) { $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $global:FakeStatePath -Encoding UTF8 }
 function global:Add-FakeCall([string]$Text) {
@@ -52,7 +56,16 @@ function global:Invoke-FakeReAgentC {
                 'Windows RE location:'
             }
         }
-        '/disable' { $s.WinReEnabled = $false; Write-FakeState $s; Add-FakeCall 'reagentc /disable'; 'REAGENTC.EXE: Operation Successful.' }
+        '/disable' {
+            if ($env:EZMV_FAKE_FAIL_DISABLE -eq '1') {
+                Add-FakeCall 'reagentc /disable (failed)'
+                $global:LASTEXITCODE = 2
+                return 'REAGENTC.EXE: Operation failed: 2'
+            }
+            $s.WinReEnabled = $false; Write-FakeState $s
+            Set-Content -LiteralPath $global:EzmvWinReImage -Value 'fake winre image' -Encoding ASCII
+            Add-FakeCall 'reagentc /disable'; 'REAGENTC.EXE: Operation Successful.'
+        }
         '/enable'  {
             # like the real one: the image goes to a recovery partition on the
             # disk if there is one (otherwise it stays where it was)
@@ -60,7 +73,9 @@ function global:Invoke-FakeReAgentC {
                 Where-Object { "$($_.GptType)".ToLower() -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' } |
                 Sort-Object Offset | Select-Object -First 1)
             if ($rec.Count -gt 0) { $s.WinRePartition = [int]$rec[0].PartitionNumber }
-            $s.WinReEnabled = $true; Write-FakeState $s; Add-FakeCall 'reagentc /enable'; 'REAGENTC.EXE: Operation Successful.'
+            $s.WinReEnabled = $true; Write-FakeState $s
+            Remove-Item -LiteralPath $global:EzmvWinReImage -Force -ErrorAction SilentlyContinue
+            Add-FakeCall 'reagentc /enable'; 'REAGENTC.EXE: Operation Successful.'
         }
         default    { throw ('fake reagentc: unexpected arguments ' + ($args -join ' ')) }
     }

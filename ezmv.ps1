@@ -73,6 +73,10 @@
 .PARAMETER StopAfterPhase
     Testing only: stop after the given step (1-9) to simulate an interruption.
 
+.PARAMETER KillAt
+    Testing only: kill the process at a named point inside a step
+    (after-temp-created, after-donor-deleted), like a power cut.
+
 .PARAMETER KillAfterPhase
     Testing only: kill the process right after the given step (1-9) is saved,
     skipping every clean-up, like a power cut.
@@ -100,11 +104,12 @@ param(
     [string]$DataLetter,
     [string]$DataLabel = 'Data',
     [int]$StopAfterPhase = 0,
-    [int]$KillAfterPhase = 0
+    [int]$KillAfterPhase = 0,
+    [string]$KillAt
 )
 
 $ErrorActionPreference = 'Stop'
-$EzmvVersion = '0.10.0'
+$EzmvVersion = '0.11.0'
 $RecoveryGptType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
 $TempLabel = 'ezmv-temp'
 $RecoveryLabel = 'Windows RE tools'
@@ -276,7 +281,7 @@ function Compare-TreeHash([string]$FromRoot, [string]$ToRoot) {
     }
     Write-Progress -Activity 'Comparing file contents (SHA-256)' -Completed
     return New-Object psobject -Property @{
-        Ok         = ($bad.Count -eq 0)
+        Ok         = ($bad.Count -eq 0 -and ($unread + $tree.Unreadable) -eq 0)
         Count      = $total
         Mismatch   = $bad
         Unreadable = ($unread + $tree.Unreadable)
@@ -296,13 +301,16 @@ function Get-ExcludeDirs([string]$Root) {
 
 # Copies a whole tree with robocopy and shows progress. Returns the robocopy
 # exit code (8 or higher means something failed).
-function Copy-Tree([string]$FromRoot, [string]$ToRoot, [string]$LogFile, [int64]$ExpectedBytes, [string]$ProgressLetter) {
+function Copy-Tree([string]$FromRoot, [string]$ToRoot, [string]$LogFile, [int64]$ExpectedBytes, [string]$ProgressLetter, [switch]$Mirror) {
     $ex = Get-ExcludeDirs $FromRoot
     $src = Get-RoboPath $FromRoot
     $dst = Get-RoboPath $ToRoot
     if ($src -notmatch '\\$') { $src = '"' + $src + '"' }
     if ($dst -notmatch '\\$') { $dst = '"' + $dst + '"' }
     $argLine = ('{0} {1} /E {2} /DCOPY:DAT /XJ /R:1 /W:1 /NP /NFL /NDL "/LOG:{3}" /XD "{4}" "{5}"' -f $src, $dst, ($script:RoboCopyFlags -join ' '), $LogFile, $ex[0], $ex[1])
+    # mirror: also remove files from the copy that were deleted from the
+    # source; the system folders are excluded by name so they are never purged
+    if ($Mirror) { $argLine += ' /PURGE /XD "System Volume Information" "$RECYCLE.BIN"' }
     $baseline = 0
     if ($ProgressLetter) { $baseline = Get-UsedBytes $ProgressLetter }
     $proc = Start-Process -FilePath 'robocopy.exe' -ArgumentList $argLine -PassThru -WindowStyle Hidden
@@ -351,21 +359,35 @@ function Get-WinReInfo {
     return $info
 }
 
-function Remove-PartitionAtOffset([int]$DiskNumber, [int64]$Offset) {
+# Runs diskpart commands through standard input. No script file is written,
+# so nothing a normal user can reach is ever executed with admin rights.
+function Invoke-DiskPart([string[]]$Lines) {
+    $text = (@($Lines) + 'exit') -join "`r`n"
+    return ($text | & diskpart.exe | Out-String)
+}
+
+# GPT partition GUID as a lower-case string, or '' if there is none.
+function Get-PartGuid($Partition) {
+    if (-not $Partition) { return '' }
+    return "$($Partition.Guid)".Trim().ToLower()
+}
+
+# Deletes the partition at an exact offset. When ExpectGuid is given, the
+# partition there must still be the one ezmv recorded, or nothing is deleted.
+function Remove-PartitionAtOffset([int]$DiskNumber, [int64]$Offset, [string]$ExpectGuid = '', [string]$ExpectType = '') {
     $p = Get-Layout $DiskNumber | Where-Object { [int64]$_.Offset -eq $Offset }
     if (-not $p) { return }
+    if ($ExpectGuid -and (Get-PartGuid $p) -ne $ExpectGuid.Trim().ToLower()) {
+        throw ('The partition at offset ' + (ToGB $Offset) + ' GB is not the one ezmv recorded (its GUID changed). Nothing was deleted. Stopping to be safe.')
+    }
+    if ($ExpectType -and "$($p.GptType)".ToLower() -ne $ExpectType.ToLower()) {
+        throw ('The partition at offset ' + (ToGB $Offset) + ' GB is no longer of the expected type. Nothing was deleted. Stopping to be safe.')
+    }
     try {
         Remove-Partition -DiskNumber $DiskNumber -PartitionNumber $p.PartitionNumber -Confirm:$false
     } catch {
         Say ('  Remove-Partition refused, retrying with diskpart: ' + $_.Exception.Message) 'Yellow'
-        $dp = Join-Path $env:TEMP 'ezmv-diskpart.txt'
-        Set-Content -Path $dp -Encoding ASCII -Value @(
-            ('select disk ' + $DiskNumber),
-            ('select partition ' + $p.PartitionNumber),
-            'delete partition override'
-        )
-        & diskpart.exe /s $dp | Out-Host
-        Remove-Item $dp -Force -ErrorAction SilentlyContinue
+        Invoke-DiskPart @(('select disk ' + $DiskNumber), ('select partition ' + $p.PartitionNumber), 'delete partition override') | Out-Host
     }
     $still = Get-Layout $DiskNumber | Where-Object { [int64]$_.Offset -eq $Offset }
     if ($still) { throw ('Could not delete the partition at offset ' + (ToGB $Offset) + ' GB.') }
@@ -419,27 +441,27 @@ function New-RecoveryPartition([int]$DiskNumber, [int64]$Offset, [int64]$Size) {
         }
         Start-Sleep -Seconds 2
     }
-    if ("$($p.GptType)".ToLower() -eq $RecoveryGptType) { return $p }
-    $fs = ''
-    try { $fs = "$((Get-Volume -Partition $p -ErrorAction Stop).FileSystem)" } catch { }
-    if ($fs -ne 'NTFS') {
-        Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel $RecoveryLabel -Confirm:$false | Out-Null
-        Start-Sleep -Seconds 1
+    # Every run reconciles all of it, so a run interrupted half way through
+    # (for example type set but attributes not yet) is finished properly.
+    $isRec = ("$($p.GptType)".ToLower() -eq $RecoveryGptType)
+    if (-not $isRec) {
+        $fs = ''
+        try { $fs = "$((Get-Volume -Partition $p -ErrorAction Stop).FileSystem)" } catch { }
+        if ($fs -ne 'NTFS') {
+            Format-Volume -Partition $p -FileSystem NTFS -NewFileSystemLabel $RecoveryLabel -Confirm:$false | Out-Null
+            Start-Sleep -Seconds 1
+        }
     }
-    $dp = Join-Path $env:TEMP 'ezmv-diskpart-recovery.txt'
-    Set-Content -Path $dp -Encoding ASCII -Value @(
-        ('select disk ' + $DiskNumber),
-        ('select partition ' + $p.PartitionNumber),
-        ('set id=' + $RecoveryGptType.Trim('{}') + ' override'),
-        'gpt attributes=0x8000000000000001'
-    )
-    & diskpart.exe /s $dp | Out-Null
-    Remove-Item $dp -Force -ErrorAction SilentlyContinue
+    $cmds = @(('select disk ' + $DiskNumber), ('select partition ' + $p.PartitionNumber))
+    if (-not $isRec) { $cmds += ('set id=' + $RecoveryGptType.Trim('{}') + ' override') }
+    if ((Get-GptAttributes $DiskNumber ([int]$p.PartitionNumber)) -ne '8000000000000001') { $cmds += 'gpt attributes=0x8000000000000001' }
+    if ($cmds.Count -gt 2) { Invoke-DiskPart $cmds | Out-Null }
+    Update-HostStorageCache
     $p = Get-Layout $DiskNumber | Where-Object { [int64]$_.Offset -eq $Offset }
     if (-not $p -or "$($p.GptType)".ToLower() -ne $RecoveryGptType) { throw 'Could not mark the new partition as a recovery partition.' }
     $attr = Get-GptAttributes $DiskNumber ([int]$p.PartitionNumber)
     if ($attr -ne '8000000000000001') {
-        Say ('  The recovery partition attributes are ' + $attr + ' instead of 8000000000000001 (required, no drive letter).') 'Yellow'
+        throw ('The recovery partition attributes are ' + $attr + ' instead of 8000000000000001 (required, no drive letter). Start ezmv again to retry.')
     }
     return $p
 }
@@ -447,24 +469,54 @@ function New-RecoveryPartition([int]$DiskNumber, [int64]$Offset, [int64]$Size) {
 # GPT attributes of a partition as a hex string (for example 8000000000000001),
 # read from diskpart because Get-Partition does not show them all.
 function Get-GptAttributes([int]$DiskNumber, [int]$PartitionNumber) {
-    $dp = Join-Path $env:TEMP 'ezmv-diskpart-detail.txt'
-    Set-Content -Path $dp -Encoding ASCII -Value @(('select disk ' + $DiskNumber), ('select partition ' + $PartitionNumber), 'detail partition')
-    $out = (& diskpart.exe /s $dp | Out-String)
-    Remove-Item $dp -Force -ErrorAction SilentlyContinue
+    $out = Invoke-DiskPart @(('select disk ' + $DiskNumber), ('select partition ' + $PartitionNumber), 'detail partition')
     if ($out -match 'Attrib\s*:\s*0[xX]([0-9A-Fa-f]+)') { return $Matches[1].ToUpper().PadLeft(16, '0') }
     return ''
 }
 
 # Deletes a folder tree, including files whose permissions deny access (backup
 # mode) and paths longer than 260 characters. Returns $true when it is gone.
+# No shell is involved, so names like %USERNAME% are never expanded, and a
+# folder that is (or sits under) a link is refused instead of followed.
 function Remove-Folder([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if (Test-ReparseOnPath $Path) { return $false }
     $empty = Join-Path $env:TEMP ('ezmv-empty-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $empty | Out-Null
-    & robocopy.exe $empty $Path /MIR /B /R:0 /W:0 /NJH /NJS /NFL /NDL /NP | Out-Null
-    Remove-Item $empty -Force -ErrorAction SilentlyContinue
-    & cmd.exe /c ('rd /s /q "' + $Path + '"') 2>&1 | Out-Null
+    & robocopy.exe $empty $Path /MIR /XJ /B /R:0 /W:0 /NJH /NJS /NFL /NDL /NP | Out-Null
+    Remove-Item -LiteralPath $empty -Force -ErrorAction SilentlyContinue
+    try { [System.IO.Directory]::Delete(('\\?\' + $Path.TrimEnd('\')), $true) } catch { }
     return (-not (Test-Path -LiteralPath $Path))
+}
+
+# True when the path itself or any folder above it is a junction, symbolic
+# link or mount point (so it may really live on another drive).
+function Test-ReparseOnPath([string]$Path) {
+    $p = $Path.TrimEnd('\')
+    while ($p -and $p.Length -gt 3) {
+        if (Test-Path -LiteralPath $p) {
+            $a = [System.IO.File]::GetAttributes($p)
+            if ($a -band [System.IO.FileAttributes]::ReparsePoint) { return $true }
+        }
+        $p = Split-Path $p -Parent
+    }
+    return $false
+}
+
+# Total size of all files in a copy (what the new data drive must hold).
+function Get-TreeBytes([string]$Root) {
+    $t = Get-Tree $Root
+    [int64]$sum = 0
+    foreach ($rel in $t.Files) {
+        try { $sum += (New-Object System.IO.FileInfo($t.Base + '\' + $rel)).Length } catch { }
+    }
+    return $sum
+}
+
+# Where the Windows Recovery image is kept while Recovery is disabled.
+function Get-WinReImagePath {
+    if ($global:EzmvWinReImage) { return $global:EzmvWinReImage }   # tests
+    return (Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim')
 }
 
 # Where the temporary copy lives: a folder (with -StagingPath) or the
@@ -545,7 +597,10 @@ function Get-StateText($State) {
             if ($staged) { return ('All files are still on ' + $d + '. The staging folder ' + $t + ' is empty.' + $again) }
             return ('All files are still on ' + $d + '. ' + $t + ' is an empty temporary drive.' + $again)
         }
-        3 { return ('All files are still on ' + $d + '. ' + $t + ' holds a verified copy.' + $again) }
+        3 {
+            if ([bool]$State.DonorDeleting) { return ('The old ' + $d + ' may already be deleted. YOUR FILES ARE ON ' + $t + ' - do not delete ' + $t + '. Start ezmv again to continue.') }
+            return ('All files are still on ' + $d + '. ' + $t + ' holds a verified copy.' + $again)
+        }
         4 { return ('The old ' + $d + ' is deleted. YOUR FILES ARE ONLY ON ' + $t + ' - do not delete ' + $t + '.' + ' Start ezmv again to continue.') }
         5 { return ('YOUR FILES ARE ONLY ON ' + $t + ' - do not delete ' + $t + '. Start ezmv again to continue.') }
         6 { return ($c + ' has been extended. YOUR FILES ARE ONLY ON ' + $t + ' - do not delete ' + $t + '. Start ezmv again to continue.') }
@@ -560,19 +615,39 @@ function Get-StateText($State) {
 # drive and grows the data drive back.
 function Undo-Early($State) {
     $diskNo = [int]$State.DiskNumber
+    # never delete the copy unless the original data drive is still there
+    Update-HostStorageCache
+    $orig = Get-Partition -DriveLetter $State.DonorLetter -ErrorAction SilentlyContinue
+    $origOk = ($orig -and [int]$orig.DiskNumber -eq $diskNo -and [int64]$orig.Offset -eq [int64]$State.DonorOffset)
+    if ($origOk -and "$($State.DonorGuid)" -and (Get-PartGuid $orig) -ne "$($State.DonorGuid)".ToLower()) { $origOk = $false }
+    if (-not $origOk) {
+        throw ('Roll-back stopped: the original ' + $State.DonorLetter + ': is not where it was, so the copy on ' + (Get-CopyName $State) + ' is kept. Start ezmv again and choose to continue.')
+    }
     if ("$($State.StagingPath)") {
         if (-not (Remove-Folder "$($State.StagingPath)")) { Say ('  Could not delete the staging folder ' + $State.StagingPath + '. Delete it yourself; your files are on ' + $State.DonorLetter + ':.') 'Yellow' }
     }
-    if ([int64]$State.TempOffset -gt 0) {
-        $tp = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -eq [int64]$State.TempOffset }
-        if ($tp -and (Get-Letter $tp) -eq $State.TempLetter) {
-            Remove-PartitionAtOffset $diskNo ([int64]$State.TempOffset)
+    if (-not "$($State.StagingPath)") {
+        # The temporary partition may exist even when its offset was never
+        # saved (power cut right after creating it): look in the space that
+        # shrinking freed, which held nothing else.
+        $lo = [int64]$State.DonorOffset + [int64]$State.DonorShrunk - 1MB
+        $hi = [int64]$State.DonorOffset + [int64]$State.DonorSize
+        foreach ($tp in @(Get-Layout $diskNo | Where-Object { [int64]$_.Offset -ge $lo -and [int64]$_.Offset -lt $hi })) {
+            $l = Get-Letter $tp
+            if ((-not $l) -or $l -eq "$($State.TempLetter)") {
+                Remove-PartitionAtOffset $diskNo ([int64]$tp.Offset)
+            }
         }
     }
     Update-HostStorageCache
     $max = [int64](Get-PartitionSupportedSize -DriveLetter $State.DonorLetter).SizeMax
     if ($max - [int64](Get-Partition -DriveLetter $State.DonorLetter).Size -ge 1MB) {
         Resize-Partition -DriveLetter $State.DonorLetter -Size $max
+    }
+    Update-HostStorageCache
+    $now = [int64](Get-Partition -DriveLetter $State.DonorLetter).Size
+    if ([math]::Abs($now - [int64]$State.DonorSize) -gt 16MB) {
+        throw ('Roll-back did not fully restore ' + $State.DonorLetter + ': (it is ' + (ToGB $now) + ' GB, it was ' + (ToGB $State.DonorSize) + ' GB). Your files are on ' + $State.DonorLetter + ':. Check Disk Management.')
     }
 }
 
@@ -591,6 +666,34 @@ $usingDefaultState = (-not $StatePath)
 if ($usingDefaultState) { $StatePath = Join-Path $defaultStateDir 'state.json' }
 $script:ProtectState = $true
 $logDir = Join-Path (Split-Path $StatePath -Parent) 'logs'
+
+# Moves Windows Recovery off a partition that is about to be deleted. Fails
+# closed: unless reagentc succeeded and the image is safely on the Windows
+# drive, nothing more is deleted.
+function Move-WinReOff([int]$DiskNumber, $Offsets) {
+    $Offsets = @($Offsets | ForEach-Object { [int64]$_ })
+    if ($Offsets.Count -eq 0) { return }
+    $winRe = Get-WinReInfo
+    $rePart = $null
+    if ($winRe.Enabled -and $winRe.Disk -eq $DiskNumber) {
+        $rePart = Get-Layout $DiskNumber | Where-Object { [int]$_.PartitionNumber -eq $winRe.Partition }
+    }
+    $wim = Get-WinReImagePath
+    if ($rePart -and ($Offsets -contains [int64]$rePart.Offset)) {
+        Step 'Moving Windows Recovery off the partition that will be removed (re-enabled at the end)'
+        $S.WinReDisabled = $true
+        Save-State $S $StatePath
+        $script:winReDisabled = $true
+        $global:LASTEXITCODE = 0
+        & reagentc.exe /disable | Out-Host
+        $rc = $LASTEXITCODE
+        if ($rc -ne 0 -or (Get-WinReInfo).Enabled -or -not (Test-Path -LiteralPath $wim)) {
+            throw ('Windows Recovery could not be moved off its partition (reagentc exit code ' + $rc + ', image on the Windows drive: ' + (Test-Path -LiteralPath $wim) + '). The recovery partition was not deleted. Check "reagentc /info", then start ezmv again.')
+        }
+    } elseif ([bool]$S.WinReDisabled -and -not (Test-Path -LiteralPath $wim)) {
+        throw ('Windows Recovery was disabled by ezmv, but its image is not on the Windows drive (' + $wim + '). The recovery partition was not deleted. Check "reagentc /info", then start ezmv again.')
+    }
+}
 
 function Complete-Phase([int]$Number) {
     $S.Phase = $Number
@@ -616,6 +719,21 @@ try {
         }
         Protect-AdminOnly $defaultStateDir
     }
+    if (-not $usingDefaultState) {
+        # A custom resume file gets the same protection: its folder is locked
+        # to Administrators and SYSTEM, so nobody can swap the file later.
+        $sDir = Split-Path ([System.IO.Path]::GetFullPath($StatePath)) -Parent
+        $sLeaf = Split-Path $StatePath -Leaf
+        if (Test-Path -LiteralPath $sDir) {
+            if (Test-ReparseOnPath $sDir) { throw ('The folder for the resume file (' + $sDir + ') is a link or mount point. Use a plain folder for -StatePath.') }
+            if (-not (Test-TrustedOwner $sDir)) { throw ('The folder for the resume file (' + $sDir + ') is not owned by Administrators. Use a new folder for -StatePath.') }
+            $other = @(Get-ChildItem -LiteralPath $sDir -Force | Where-Object { @($sLeaf, ($sLeaf + '.tmp'), 'logs') -notcontains $_.Name })
+            if ($other.Count -gt 0) { throw ('The folder ' + $sDir + ' holds other files. ezmv locks the folder of its resume file to Administrators, so use an empty or new folder for -StatePath.') }
+        } else {
+            New-Item -ItemType Directory -Path $sDir -Force | Out-Null
+        }
+        Protect-AdminOnly $sDir
+    }
     if ((Test-Path $StatePath) -and -not (Test-TrustedOwner $StatePath)) {
         throw ('The resume file ' + $StatePath + ' is owned by ' + (Get-OwnerSid $StatePath) + ', not by Administrators, so it may have been tampered with. ezmv will not act on it. Check it, delete it if you did not create it, then run ezmv again.')
     }
@@ -629,7 +747,19 @@ try {
 
     # ---- unfinished run? ---------------------------------------------------
     $saved = Read-State $StatePath
+    if ($saved -and -not $PlanOnly) {
+        # Clean-up an earlier run still owes (it may have died before doing
+        # it). It happens in finally, whatever this run does next.
+        $cL = "$($saved.TargetLetter)"
+        if ([bool]$saved.BitLockerSuspended) { $bitLockerSuspended = $true }
+        if ([bool]$saved.WinReDisabled) { $winReDisabled = $true }
+    }
     if ($saved -and [int]$saved.Phase -ge 10) {
+        if ($bitLockerSuspended -or $winReDisabled) {
+            Step 'Finishing the clean-up of the last run'
+            $S = $saved
+            return
+        }
         Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
         $saved = $null
     }
@@ -655,11 +785,13 @@ try {
         } elseif ("$($saved.Mode)" -eq 'FromFree') {
             Say '  Left as it is. Start ezmv again when you want to finish.' 'Yellow'
             return
-        } elseif ([int]$saved.Phase -le 3) {
+        } elseif ([int]$saved.Phase -le 3 -and -not [bool]$saved.DonorDeleting) {
             if (Ask-YesNo ('Roll back instead (remove the temporary drive and grow ' + $saved.DonorLetter + ': back)?')) {
                 Step 'Rolling back'
                 Undo-Early $saved
-                Remove-Item $StatePath -Force
+                # marked done; the file is removed once clean-up has finished
+                $saved.Phase = 10
+                Save-State $saved $StatePath
                 # undo what an earlier, interrupted run left suspended (done in finally)
                 $cL = "$($saved.TargetLetter)"
                 if ([bool]$saved.BitLockerSuspended) { $bitLockerSuspended = $true }
@@ -724,7 +856,7 @@ try {
             $recreate = $true
             $recSize = [int64]$RecoveryMinSize
             Say ('  a new hidden recovery partition (' + (ToGB $recSize) + ' GB) will be created right after ' + $tLetterIn + ':, and Windows Recovery moved onto it')
-            if (-not $winRe.Enabled -and -not (Test-Path (Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'))) {
+            if (-not $winRe.Enabled -and -not (Test-Path -LiteralPath (Get-WinReImagePath))) {
                 Say '  The Windows Recovery image (Winre.wim) was not found on the Windows drive, so Recovery may not turn on. The partition is created anyway.' 'Yellow'
             }
         }
@@ -789,6 +921,7 @@ try {
             DiskGuid       = "$($disk.Guid)"
             TargetLetter   = $tLetterIn
             TargetOrigSize = [int64]$cPart.Size
+            TargetGuid     = (Get-PartGuid $cPart)
             DonorLetter    = $newLetter
             DonorLabel     = $DataLabel
             DonorEncrypted = $false
@@ -954,6 +1087,7 @@ try {
             if ($raw -match '^[A-Za-z]:\\?$') { $raw = $raw.Substring(0, 2) + '\ezmv-staging' }
             if ($raw -notmatch '^[A-Za-z]:\\') { throw ('-StagingPath must be a full folder path on a local drive, like E:\ezmv-staging.') }
             $staging = [System.IO.Path]::GetFullPath($raw).TrimEnd('\')
+            if (Test-ReparseOnPath $staging) { throw ('The staging folder ' + $staging + ' is, or sits under, a junction, link or mount point, so it could really be on another drive. Use a plain folder.') }
             $sLetter = $staging.Substring(0, 1).ToUpper()
             if ($sLetter -eq $dLetter.ToUpper()) { throw ('The staging folder cannot be on ' + $dLetter + ':, which will be deleted and recreated.') }
             $sVol = Get-Volume -DriveLetter $sLetter -ErrorAction SilentlyContinue
@@ -1059,6 +1193,12 @@ try {
             DiskGuid       = "$($disk.Guid)"
             TargetLetter   = $tLetterIn
             TargetOrigSize = [int64]$cPart.Size
+            TargetGuid     = (Get-PartGuid $cPart)
+            DonorGuid      = (Get-PartGuid $donor)
+            BetweenGuids   = @($between | ForEach-Object { Get-PartGuid $_ })
+            DonorDeleting  = $false
+            TempGuid       = ''
+            CopyBytes      = [int64]0
             DonorLetter    = $dLetter
             DonorLabel     = $dLabel
             DonorOffset    = $dOffset
@@ -1103,6 +1243,22 @@ try {
         if (-not ($S.PSObject.Properties.Name -contains $f)) { $S | Add-Member -NotePropertyName $f -NotePropertyValue ([int64]0) }
     }
     if (-not ($S.PSObject.Properties.Name -contains 'StagingPath')) { $S | Add-Member -NotePropertyName 'StagingPath' -NotePropertyValue '' }
+    foreach ($f in 'TargetGuid', 'DonorGuid', 'TempGuid') {
+        if (-not ($S.PSObject.Properties.Name -contains $f)) { $S | Add-Member -NotePropertyName $f -NotePropertyValue '' }
+    }
+    if (-not ($S.PSObject.Properties.Name -contains 'BetweenGuids')) { $S | Add-Member -NotePropertyName 'BetweenGuids' -NotePropertyValue @() }
+    if (-not ($S.PSObject.Properties.Name -contains 'DonorDeleting')) { $S | Add-Member -NotePropertyName 'DonorDeleting' -NotePropertyValue $false }
+    if (-not ($S.PSObject.Properties.Name -contains 'CopyBytes')) { $S | Add-Member -NotePropertyName 'CopyBytes' -NotePropertyValue ([int64]0) }
+
+    # The drive letters must still belong to the partitions ezmv started with.
+    if ("$($S.TargetGuid)") {
+        $tNow = Get-Partition -DriveLetter $cL -ErrorAction SilentlyContinue
+        if (-not $tNow -or (Get-PartGuid $tNow) -ne "$($S.TargetGuid)".ToLower()) { throw ($cL + ': is not the partition ezmv started with (its GUID changed). Stopping to be safe.') }
+    }
+    if ("$($S.Mode)" -ne 'FromFree' -and [int]$S.Phase -lt 4 -and -not [bool]$S.DonorDeleting -and "$($S.DonorGuid)") {
+        $dNow = Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue
+        if (-not $dNow -or (Get-PartGuid $dNow) -ne "$($S.DonorGuid)".ToLower()) { throw ($dL + ': is not the partition ezmv started with (its GUID changed). Stopping to be safe.') }
+    }
 
     # After step 3 the files may only exist in the staging folder: make sure
     # its drive is plugged in before going on.
@@ -1192,7 +1348,9 @@ try {
         } else {
             Step ('Step 2/10: creating temporary drive ' + $tL + ':')
             $tPart = New-DataDrive $diskNo $tL $TempLabel ([int64]$S.AllocUnit) ([int64]$S.DonorOffset + [int64]$S.DonorShrunk) ([int64]$S.DonorOffset + [int64]$S.DonorSize)
+            if ($KillAt -eq 'after-temp-created') { Stop-Process -Id $PID -Force }
             $S.TempOffset = [int64]$tPart.Offset
+            $S.TempGuid = Get-PartGuid $tPart
             if ([int64](Get-Volume -DriveLetter $tL).SizeRemaining -le $used) { throw ('The temporary drive is too small for the files on ' + $dL + ':.') }
         }
         Complete-Phase 2
@@ -1217,7 +1375,7 @@ try {
             $h = Compare-TreeHash ($dL + ':\') $copyRoot
             if (-not $h.Ok) {
                 $h.Mismatch | Select-Object -First 20 | ForEach-Object { Say ('    ' + $_) 'Red' }
-                throw ('Content check failed for ' + $h.Mismatch.Count + ' file(s).')
+                throw ('Content check failed: ' + $h.Mismatch.Count + ' file(s) different, ' + $h.Unreadable + ' could not be read. Nothing was deleted.')
             }
             Say ('  content check: ' + $h.Count + ' files identical, ' + $h.Unreadable + ' could not be read') 'Green'
         }
@@ -1226,55 +1384,83 @@ try {
     }
 
     if ([int]$S.Phase -lt 4) {
-        Say ''
-        Say ('POINT OF NO RETURN: the old ' + $dL + ': will now be deleted. Your files will live only on ' + $copyName + ' until they are copied back.') 'Yellow'
-        if ($stg) { Say ('Do not unplug the drive that holds ' + $stg + ' until ezmv has finished.') 'Yellow' }
-        if (-not (Ask-Word ('Delete the old ' + $dL + ':?') 'DELETE')) {
-            $undoText = 'remove ' + $tL + ': and grow ' + $dL + ': back'
-            if ($stg) { $undoText = 'delete the staging folder' }
-            if (Ask-YesNo ('Roll back now (' + $undoText + ')?')) {
-                Step 'Rolling back'
-                Undo-Early $S
-                Remove-Item $StatePath -Force
-                $S = $null
-                Say '  Rolled back. The disk is as it was before.' 'Green'
-                Show-Layout $diskNo
-                return
-            }
-            throw 'Stopped by you before deleting anything.'
-        }
-        Step ('Step 4/10: deleting the old ' + $dL + ':')
         $old = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -eq [int64]$S.DonorOffset }
-        if ($old -and (Get-Letter $old) -ne $dL) { throw ('The partition at the old position of ' + $dL + ': is not ' + $dL + ': any more. Stopping to be safe.') }
-        Remove-PartitionAtOffset $diskNo ([int64]$S.DonorOffset)
+        if ($old) {
+            if ((Get-Letter $old) -ne $dL) { throw ('The partition at the old position of ' + $dL + ': is not ' + $dL + ': any more. Stopping to be safe.') }
+            if (-not [bool]$S.DonorDeleting) {
+                Say ''
+                Say ('POINT OF NO RETURN: the old ' + $dL + ': will now be deleted. Your files will live only on ' + $copyName + ' until they are copied back.') 'Yellow'
+                if ($stg) { Say ('Do not unplug the drive that holds ' + $stg + ' until ezmv has finished.') 'Yellow' }
+                if (-not (Ask-Word ('Delete the old ' + $dL + ':?') 'DELETE')) {
+                    $undoText = 'remove ' + $tL + ': and grow ' + $dL + ': back'
+                    if ($stg) { $undoText = 'delete the staging folder' }
+                    if (Ask-YesNo ('Roll back now (' + $undoText + ')?')) {
+                        Step 'Rolling back'
+                        Undo-Early $S
+                        $S.Phase = 10
+                        Save-State $S $StatePath
+                        Say '  Rolled back. The disk is as it was before.' 'Green'
+                        Show-Layout $diskNo
+                        return
+                    }
+                    throw 'Stopped by you before deleting anything.'
+                }
+            }
+            if ($stg -and (Test-ReparseOnPath $stg)) { throw ('The staging folder ' + $stg + ' is now behind a junction, link or mount point. Nothing was deleted. Stopping to be safe.') }
+
+            # Bring the copy up to date with anything that changed on the data
+            # drive since it was verified (also after a pause between runs).
+            Step ('Final sync: copying anything that changed on ' + $dL + ': since the check')
+            $log = Join-Path $logDir ('final_sync_' + $stamp + '.log')
+            $code = Copy-Tree ($dL + ':\') $copyRoot $log 0 '' -Mirror
+            if ($code -ge 8) { throw ('The final sync reported failures (robocopy code ' + $code + '). See ' + $log + '. Nothing was deleted.') }
+            $check = Test-TreeCopy ($dL + ':\') $copyRoot
+            if (-not $check.Ok) {
+                $check.Lines | Select-Object -First 20 | ForEach-Object { Say ('    ' + $_.Trim()) 'Red' }
+                throw ('Files on ' + $dL + ': are still changing. Close every program that uses ' + $dL + ':, then start ezmv again. Nothing was deleted.')
+            }
+            if ($doHash) {
+                $h = Compare-TreeHash ($dL + ':\') $copyRoot
+                if (-not $h.Ok) { throw ('Content check before deleting failed: ' + $h.Mismatch.Count + ' different, ' + $h.Unreadable + ' unreadable. Nothing was deleted.') }
+            }
+
+            # The new data drive must hold the copy as it really is: hard links
+            # and compressed files can take more room once copied.
+            $copyBytes = Get-TreeBytes $copyRoot
+            $S.CopyBytes = [int64]$copyBytes
+            $cOff = [int64](Get-Partition -DriveLetter $cL).Offset
+            $regionEnd = [int64]$S.TempOffset
+            if ($stg) { $regionEnd = [int64]$S.DonorOffset + [int64]$S.DonorSize }
+            $recRoom = [int64]0
+            if ([bool]$S.RecreateRecovery) { $recRoom = [int64]$S.RecoverySize }
+            $newD = $regionEnd - ($cOff + [int64]$S.TargetOrigSize + [int64]$S.GiveBytes) - $recRoom
+            $needD = [int64]([double]$copyBytes * 1.03) + 256MB
+            if ($newD -lt $needD) {
+                throw ('The new ' + $dL + ': would be about ' + (ToGB $newD) + ' GB, but the copied files need ' + (ToGB $needD) + ' GB (hard links or compressed files grow when copied). Nothing was deleted. Start ezmv again, roll back, and give less space.')
+            }
+
+            Move-WinReOff $diskNo $S.BetweenOffsets
+
+            $S.DonorDeleting = $true
+            Save-State $S $StatePath
+            Step ('Step 4/10: deleting the old ' + $dL + ':')
+            Remove-PartitionAtOffset $diskNo ([int64]$S.DonorOffset) ([string]$S.DonorGuid)
+        }
+        if ($KillAt -eq 'after-donor-deleted') { Stop-Process -Id $PID -Force }
         Complete-Phase 4
     }
 
     if ([int]$S.Phase -lt 5) {
         $offsets = @($S.BetweenOffsets | ForEach-Object { [int64]$_ })
         if ($offsets.Count -gt 0) {
-            $winRe = Get-WinReInfo
-            $rePart = $null
-            if ($winRe.Enabled -and $winRe.Disk -eq $diskNo) {
-                $rePart = Get-Layout $diskNo | Where-Object { [int]$_.PartitionNumber -eq $winRe.Partition }
-            }
-            if ($rePart -and ($offsets -contains [int64]$rePart.Offset)) {
-                Step 'Disabling Windows Recovery (re-enabled at the end)'
-                $S.WinReDisabled = $true
-                Save-State $S $StatePath
-                $winReDisabled = $true
-                & reagentc.exe /disable | Out-Host
-                $wim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
-                if (-not (Test-Path $wim)) {
-                    Say '  The recovery image was not moved to the Windows drive.' 'Yellow'
-                    if (-not (Ask-YesNo '  Deleting the recovery partition may leave Windows without a recovery environment. Continue?')) {
-                        throw 'Stopped by you before deleting the recovery partition.'
-                    }
-                }
-            }
-            foreach ($o in $offsets) {
+            Move-WinReOff $diskNo $offsets
+            $guids = @($S.BetweenGuids)
+            for ($i = 0; $i -lt $offsets.Count; $i++) {
+                $o = $offsets[$i]
+                $g = ''
+                if ($guids.Count -gt $i) { $g = [string]$guids[$i] }
                 Step ('Step 5/10: deleting recovery partition at ' + (ToGB $o) + ' GB')
-                Remove-PartitionAtOffset $diskNo $o
+                Remove-PartitionAtOffset $diskNo $o $g $RecoveryGptType
             }
         }
         Complete-Phase 5
@@ -1321,7 +1507,8 @@ try {
         $dMaxOffset = [int64]$S.TempOffset - 1
         if ($stg) { $dMaxOffset = [int64]$S.DonorOffset + [int64]$S.DonorSize }
         $null = New-DataDrive $diskNo $dL $S.DonorLabel ([int64]$S.AllocUnit) $dMinOffset $dMaxOffset
-        if ([int64](Get-Volume -DriveLetter $dL).SizeRemaining -le $used) { throw ('The new ' + $dL + ': is too small for the files. They are safe on ' + $copyName + '.') }
+        $mustHold = [math]::Max([int64]$used, [int64]$S.CopyBytes)
+        if ([int64](Get-Volume -DriveLetter $dL).SizeRemaining -le $mustHold) { throw ('The new ' + $dL + ': is too small for the files. They are safe on ' + $copyName + '.') }
         Complete-Phase 7
     }
 
@@ -1341,7 +1528,7 @@ try {
             $h = Compare-TreeHash $copyRoot ($dL + ':\')
             if (-not $h.Ok) {
                 $h.Mismatch | Select-Object -First 20 | ForEach-Object { Say ('    ' + $_) 'Red' }
-                throw ('Content check failed for ' + $h.Mismatch.Count + ' file(s). Your files are safe on ' + $copyName + '.')
+                throw ('Content check failed: ' + $h.Mismatch.Count + ' file(s) different, ' + $h.Unreadable + ' could not be read. Your files are safe on ' + $copyName + '.')
             }
             Say ('  content check: ' + $h.Count + ' files identical, ' + $h.Unreadable + ' could not be read') 'Green'
         }
@@ -1350,6 +1537,27 @@ try {
     }
 
     if ([int]$S.Phase -lt 9) {
+        # Check the data drive against the copy again right before the copy is
+        # deleted: something may have changed it since step 8 (also between runs).
+        $copyThere = $false
+        if ($stg) {
+            $copyThere = (Test-Path -LiteralPath $stg)
+        } else {
+            $tp0 = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -eq [int64]$S.TempOffset }
+            $copyThere = ($tp0 -and (Get-Letter $tp0) -eq $tL)
+        }
+        if ($copyThere) {
+            Say ('  checking ' + $dL + ': against ' + $copyName + ' once more before deleting the copy...')
+            $check = Test-TreeCopy $copyRoot ($dL + ':\')
+            if (-not $check.Ok) {
+                $check.Lines | Select-Object -First 20 | ForEach-Object { Say ('    ' + $_.Trim()) 'Red' }
+                throw ('Files on ' + $dL + ': no longer match the copy on ' + $copyName + ', so the copy was NOT deleted. Start ezmv again after copying them back, or, if the changes on ' + $dL + ': are on purpose, delete ' + $copyName + ' yourself and start ezmv again to finish.')
+            }
+            if ($doHash) {
+                $h = Compare-TreeHash $copyRoot ($dL + ':\')
+                if (-not $h.Ok) { throw ('Content check failed: ' + $h.Mismatch.Count + ' different, ' + $h.Unreadable + ' unreadable. The copy on ' + $copyName + ' was NOT deleted.') }
+            }
+        }
         if ($stg) {
             if (-not (Ask-YesNo ('Delete the staging folder ' + $stg + '? Your files are now on ' + $dL + ':.'))) { throw 'Stopped by you.' }
             Step ('Step 9/10: deleting ' + $stg)
@@ -1359,7 +1567,7 @@ try {
             Step ('Step 9/10: deleting ' + $tL + ':')
             $tp = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -eq [int64]$S.TempOffset }
             if ($tp -and (Get-Letter $tp) -ne $tL) { throw ('The partition at the position of ' + $tL + ': is not ' + $tL + ': any more. Stopping to be safe.') }
-            Remove-PartitionAtOffset $diskNo ([int64]$S.TempOffset)
+            Remove-PartitionAtOffset $diskNo ([int64]$S.TempOffset) ([string]$S.TempGuid)
         }
         Complete-Phase 9
     }
@@ -1373,8 +1581,6 @@ try {
         }
         Complete-Phase 10
     }
-
-    Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
 
     Step 'Done'
     Show-Layout $diskNo
@@ -1393,9 +1599,13 @@ catch {
     Write-Host ''
     Write-Host ('STOPPED: ' + $_.Exception.Message) -ForegroundColor Red
     Write-Host ''
-    Write-Host ('Current state: ' + (Get-StateText $S)) -ForegroundColor Yellow
+    $shown = $S
+    if (-not $shown) { $shown = $saved }
+    Write-Host ('Current state: ' + (Get-StateText $shown)) -ForegroundColor Yellow
 }
 finally {
+    $cs = $S
+    if (-not $cs) { $cs = $saved }
     if ($winReDisabled) {
         Write-Host ''
         Write-Host '==> Re-enabling Windows Recovery' -ForegroundColor Cyan
@@ -1405,17 +1615,17 @@ finally {
             if (-not $reNow.Enabled) {
                 Write-Host 'Windows Recovery is still disabled. Run "reagentc /enable" again after a reboot.' -ForegroundColor Yellow
             } else {
-                if ($S -and [bool]$S.RecreateRecovery -and [int64]$S.RecoveryOffset -gt 0 -and [int]$S.Phase -ge 7) {
-                    $recP = Get-Layout ([int]$S.DiskNumber) | Where-Object { [int64]$_.Offset -eq [int64]$S.RecoveryOffset }
-                    if ($recP -and $reNow.Disk -eq [int]$S.DiskNumber -and $reNow.Partition -eq [int]$recP.PartitionNumber) {
+                if ($cs -and [bool]$cs.RecreateRecovery -and [int64]$cs.RecoveryOffset -gt 0 -and [int]$cs.Phase -ge 7) {
+                    $recP = Get-Layout ([int]$cs.DiskNumber) | Where-Object { [int64]$_.Offset -eq [int64]$cs.RecoveryOffset }
+                    if ($recP -and $reNow.Disk -eq [int]$cs.DiskNumber -and $reNow.Partition -eq [int]$recP.PartitionNumber) {
                         Write-Host ('Windows Recovery is enabled on the new recovery partition (partition ' + $recP.PartitionNumber + ').') -ForegroundColor Green
                     } else {
                         Write-Host 'Windows Recovery is enabled, but not on the new recovery partition. To move it there, run "reagentc /disable" and then "reagentc /enable".' -ForegroundColor Yellow
                     }
                 }
-                if ($S -and (Test-Path $StatePath)) {
-                    $S.WinReDisabled = $false
-                    try { Save-State $S $StatePath } catch { }
+                if ($cs -and (Test-Path $StatePath)) {
+                    $cs.WinReDisabled = $false
+                    try { Save-State $cs $StatePath } catch { }
                 }
             }
         } catch {
@@ -1426,9 +1636,9 @@ finally {
         try {
             Resume-BitLocker -MountPoint ($cL + ':') | Out-Null
             Write-Host ('BitLocker on ' + $cL + ': resumed.')
-            if ($S -and (Test-Path $StatePath)) {
-                $S.BitLockerSuspended = $false
-                try { Save-State $S $StatePath } catch { }
+            if ($cs -and (Test-Path $StatePath)) {
+                $cs.BitLockerSuspended = $false
+                try { Save-State $cs $StatePath } catch { }
             }
         } catch {
             Write-Host ('Could not resume BitLocker on ' + $cL + ': - run:  Resume-BitLocker -MountPoint ' + $cL + ':') -ForegroundColor Yellow
@@ -1436,6 +1646,13 @@ finally {
     }
     if ($shellSvcStopped) {
         try { Start-Service -Name ShellHWDetection } catch { }
+    }
+    # The resume file goes only when the disk work is done AND nothing is
+    # left to restore, so a failed clean-up is retried by the next run.
+    if ($cs -and [int]$cs.Phase -ge 10 -and -not [bool]$cs.BitLockerSuspended -and -not [bool]$cs.WinReDisabled) {
+        Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
+    } elseif ($cs -and [int]$cs.Phase -ge 10) {
+        Write-Host ('Some clean-up is still pending. Start ezmv again to finish it. Resume file: ' + $StatePath) -ForegroundColor Yellow
     }
     if ($transcriptOn) {
         try { Stop-Transcript | Out-Null } catch { }

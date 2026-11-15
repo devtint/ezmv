@@ -88,6 +88,35 @@ try {
     Check 'second copy repairs the destination' (($code -lt 8) -and (Test-TreeCopy $src $dst).Ok)
 
     Write-Host ''
+    Write-Host 'Failing closed' -ForegroundColor Cyan
+    $code = Copy-Tree $src $dst (Join-Path $root 'copy3.log') 0 ''
+    $locked = Join-Path $src 'locked.txt'
+    Set-Content -Path $locked -Value 'locked' -Encoding ASCII
+    Copy-Item -LiteralPath $locked -Destination (Join-Path $dst 'locked.txt')
+    $origAcl = Get-Acl -LiteralPath $locked
+    $denyAcl = Get-Acl -LiteralPath $locked
+    $everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+    $denyAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($everyone, 'Read', 'Deny')))
+    Set-Acl -LiteralPath $locked -AclObject $denyAcl
+    $h = Compare-TreeHash $src $dst
+    Set-Acl -LiteralPath $locked -AclObject $origAcl
+    Check ('hash check fails when a file cannot be read (' + $h.Unreadable + ' unreadable)') ((-not $h.Ok) -and $h.Unreadable -ge 1)
+
+    Check 'a path under a junction is detected' (Test-ReparseOnPath (Join-Path $link 'x\y'))
+    Check 'a plain path is not' (-not (Test-ReparseOnPath (Join-Path $src 'sub')))
+    Check 'Remove-Folder refuses a junction' (-not (Remove-Folder $link))
+    Check 'and leaves its target alone' (Test-Path (Join-Path $outside 'outside.txt'))
+
+    $named = Join-Path $root $env:USERNAME
+    New-Item -ItemType Directory -Path $named | Out-Null
+    Set-Content -Path (Join-Path $named 'keep.txt') -Value 'keep' -Encoding ASCII
+    $literal = Join-Path $root '%USERNAME%'
+    New-Item -ItemType Directory -Path $literal | Out-Null
+    Set-Content -LiteralPath (Join-Path $literal 'junk.txt') -Value 'junk' -Encoding ASCII
+    Check 'Remove-Folder deletes a folder literally named %USERNAME%' (Remove-Folder $literal)
+    Check 'and not the folder named after the user' (Test-Path (Join-Path $named 'keep.txt'))
+
+    Write-Host ''
     Write-Host 'Helpers' -ForegroundColor Cyan
     Check 'Get-RoboPath keeps a drive root' ((Get-RoboPath 'D:\') -eq 'D:\' -and (Get-RoboPath 'D:') -eq 'D:\')
     Check 'Get-RoboPath trims a folder' ((Get-RoboPath 'C:\some dir\') -eq 'C:\some dir')

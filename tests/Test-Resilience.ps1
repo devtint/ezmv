@@ -12,10 +12,16 @@
 
       A. Planted resume file: a resume file, and a default ezmv folder, owned
          by a normal user must be refused before anything happens.
-      B. Killed after step 3 with BitLocker on, then rolled back: BitLocker must
-         be resumed and the disk must be as before.
-      C. Killed after step 5 with BitLocker on and Windows Recovery on the
-         partition being removed: the resumed run must finish, resume BitLocker,
+      B. Killed right after the temporary drive was created (before its
+         position was saved), then rolled back: the temporary drive must be
+         found and removed, BitLocker resumed, and the disk as before.
+      B2. Files changed after the copy was checked, then killed right after
+         D: was deleted (before that was saved): the change must be in the
+         copy, roll-back must not be offered, and the run must finish.
+      C. reagentc /disable fails: nothing is deleted. Then killed after step 8,
+         a restored file damaged: the copy must not be deleted. Then killed
+         after step 10 before clean-up: the next run must resume BitLocker.
+         The run must finish, resume BitLocker,
          create a hidden recovery partition right after the target and move
          Windows Recovery onto it.
       D. Data drive more than half full: refused without -StagingPath, and
@@ -74,6 +80,7 @@ function Invoke-Ezmv([string[]]$EzmvArgs, [string]$Answers = '') {
 }
 
 function New-FakeState([string]$BitLockerLetter, [int]$WinReDisk, [int]$WinRePartition) {
+    Remove-Item -LiteralPath (Join-Path $WorkDir 'Winre.wim') -Force -ErrorAction SilentlyContinue
     [pscustomobject]@{
         BitLockerLetter = $BitLockerLetter; BitLockerOn = $true
         WinReEnabled = $true; WinReDisk = $WinReDisk; WinRePartition = $WinRePartition
@@ -154,7 +161,7 @@ try {
     Write-Host ''
     Write-Host 'Building the virtual disk' -ForegroundColor Cyan
     $dp = Join-Path $WorkDir 'create.txt'
-    Set-Content -Path $dp -Encoding ASCII -Value ('create vdisk file="' + $vhd + '" maximum=10240 type=expandable')
+    Set-Content -Path $dp -Encoding ASCII -Value ('create vdisk file="' + $vhd + '" maximum=12288 type=expandable')
     & diskpart.exe /s $dp | Out-Null
     if (-not (Test-Path $vhd)) { throw 'diskpart could not create the virtual disk.' }
     Mount-DiskImage -ImagePath $vhd -NoDriveLetter | Out-Null
@@ -183,12 +190,14 @@ try {
 
     # ------------------------------------------------------------------ B --
     Write-Host ''
-    Write-Host 'B. Killed after step 3 with BitLocker on, then rolled back' -ForegroundColor Cyan
+    Write-Host 'B. Killed right after the temporary drive was created, then rolled back' -ForegroundColor Cyan
     New-FakeState $tL $diskNo ([int]$rp.PartitionNumber)
-    $null = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-StatePath', $statePath, '-KillAfterPhase', '3')
+    $null = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-StatePath', $statePath, '-KillAt', 'after-temp-created')
     $mid = Read-State $statePath
     $f = Get-FakeState
-    Check 'killed run left the resume file at step 3' ($mid -and [int]$mid.Phase -eq 3)
+    Update-HostStorageCache
+    Check 'killed run left the resume file at step 1, temporary position not saved' ($mid -and [int]$mid.Phase -eq 1 -and [int64]$mid.TempOffset -eq 0)
+    Check 'the temporary drive exists anyway' ($mid -and [bool](Get-Partition -DriveLetter $mid.TempLetter -ErrorAction SilentlyContinue))
     Check 'resume file records that ezmv suspended BitLocker' ($mid -and [bool]$mid.BitLockerSuspended)
     Check 'BitLocker is left suspended by the kill (as after a power cut)' (-not $f.BitLockerOn)
 
@@ -203,25 +212,77 @@ try {
     Check 'files on the data drive are unchanged' (Test-Manifest $manifest $dL)
     Check 'Windows Recovery was never touched' ($f.WinReEnabled -and (@($f.Calls) -notcontains 'reagentc /disable'))
 
+    # ----------------------------------------------------------------- B2 --
+    Write-Host ''
+    Write-Host 'B2. Change after the check, then killed right after deleting D:' -ForegroundColor Cyan
+    New-FakeState $tL $diskNo ([int]$rp.PartitionNumber)
+    $targetBefore = [int64](Get-Partition -DriveLetter $tL).Size
+    $null = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-StatePath', $statePath, '-KillAfterPhase', '3')
+    $mid = Read-State $statePath
+    Check 'killed run left the resume file at step 3' ($mid -and [int]$mid.Phase -eq 3)
+    $tmpL = "$($mid.TempLetter)"
+    Set-Content -Path ($dL + ':\docs\late.txt') -Value 'written after the copy was checked' -Encoding ASCII
+    $manifest = Get-Manifest $dL
+
+    $null = Invoke-Ezmv @('-Yes', '-StatePath', $statePath, '-KillAt', 'after-donor-deleted')
+    $mid = Read-State $statePath
+    Update-HostStorageCache
+    Check 'killed run left step 3 with the deletion recorded' ($mid -and [int]$mid.Phase -eq 3 -and [bool]$mid.DonorDeleting)
+    Check 'the old data drive is gone' (-not (Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue))
+    Check 'the late change made it into the copy' (Test-Path ($tmpL + ':\docs\late.txt'))
+
+    $r = Invoke-Ezmv @('-StatePath', $statePath) 'n'
+    Update-HostStorageCache
+    Check 'roll-back is not offered after the deletion' ($r.Text -like '*past the point*' -and $r.Text -notlike '*Roll back instead*')
+    Check 'the temporary drive still holds the files' (Test-Path ($tmpL + ':\docs\late.txt'))
+
+    $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
+    Update-HostStorageCache
+    Check 'the run finishes' ($r.Code -eq 0 -and -not (Test-Path $statePath))
+    Check 'target grew by 1 GB' ([math]::Abs([int64](Get-Partition -DriveLetter $tL).Size - $targetBefore - 1GB) -le 1MB)
+    Check 'files, including the late change, are on the new data drive' (Test-Manifest $manifest $dL)
+
     # ------------------------------------------------------------------ C --
     Write-Host ''
-    Write-Host 'C. Killed after step 5 with BitLocker and Windows Recovery on, then resumed' -ForegroundColor Cyan
+    Write-Host 'C. Recovery disable fails, damaged file after step 8, killed before clean-up' -ForegroundColor Cyan
     $rp = Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType }
     New-FakeState $tL $diskNo ([int]$rp.PartitionNumber)
-    $null = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-StatePath', $statePath, '-KillAfterPhase', '5')
+    $targetBefore = [int64](Get-Partition -DriveLetter $tL).Size
+    $env:EZMV_FAKE_FAIL_DISABLE = '1'
+    $r = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-StatePath', $statePath)
+    $env:EZMV_FAKE_FAIL_DISABLE = ''
+    Update-HostStorageCache
+    $mid = Read-State $statePath
+    Check 'failed reagentc /disable stops the run' ($r.Code -eq 1 -and $r.Text -like '*could not be moved off*')
+    Check 'nothing was deleted (data drive and recovery partition still there)' ([bool](Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue) -and @(Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType }).Count -eq 1)
+    Check 'BitLocker was resumed after the stop' ((Get-FakeState).BitLockerOn)
+
+    $null = Invoke-Ezmv @('-Yes', '-StatePath', $statePath, '-KillAfterPhase', '8')
     $mid = Read-State $statePath
     $f = Get-FakeState
-    Check 'killed run left the resume file at step 5' ($mid -and [int]$mid.Phase -eq 5)
+    Check 'killed run left the resume file at step 8' ($mid -and [int]$mid.Phase -eq 8)
     Check 'resume file records BitLocker suspended and Recovery disabled' ($mid -and [bool]$mid.BitLockerSuspended -and [bool]$mid.WinReDisabled)
     Check 'BitLocker and Windows Recovery are left off by the kill' ((-not $f.BitLockerOn) -and (-not $f.WinReEnabled))
+
+    $tmpL = "$($mid.TempLetter)"
+    $victim = Get-ChildItem -LiteralPath ($dL + ':\docs') -File | Select-Object -First 1
+    [System.IO.File]::AppendAllText($victim.FullName, 'damage')
+    $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
+    Update-HostStorageCache
+    Check 'a damaged restored file stops the run' ($r.Code -eq 1 -and $r.Text -like '*no longer match*')
+    Check 'the copy was not deleted' (Test-Path ($tmpL + ':\docs\' + $victim.Name))
+    Copy-Item -LiteralPath ($tmpL + ':\docs\' + $victim.Name) -Destination $victim.FullName -Force
+
+    $null = Invoke-Ezmv @('-Yes', '-StatePath', $statePath, '-KillAfterPhase', '10')
+    $mid = Read-State $statePath
+    Check 'killed after step 10 with BitLocker still suspended' ($mid -and [int]$mid.Phase -eq 10 -and [bool]$mid.BitLockerSuspended -and -not (Get-FakeState).BitLockerOn)
 
     $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
     $f = Get-FakeState
     Update-HostStorageCache
-    Check 'resumed run exits cleanly' ($r.Code -eq 0)
-    Check 'resumed run resumed BitLocker' ($f.BitLockerOn)
-    Check 'resumed run re-enabled Windows Recovery' ($f.WinReEnabled -and (@($f.Calls) -contains 'reagentc /enable'))
-    Check 'BitLocker was suspended only once' (@(@($f.Calls) | Where-Object { $_ -like 'Suspend-BitLocker*' }).Count -eq 1)
+    Check 'next run finishes the clean-up and exits cleanly' ($r.Code -eq 0 -and $r.Text -like '*Finishing the clean-up*')
+    Check 'BitLocker is back on' ($f.BitLockerOn)
+    Check 'Windows Recovery is enabled' ($f.WinReEnabled -and (@($f.Calls) -contains 'reagentc /enable'))
     Check 'resume file was removed' (-not (Test-Path $statePath))
     Check 'target grew by 1 GB' ([math]::Abs([int64](Get-Partition -DriveLetter $tL).Size - $targetBefore - 1GB) -le 1MB)
     Check 'files on the data drive are unchanged' (Test-Manifest $manifest $dL)
@@ -232,6 +293,14 @@ try {
     Write-Host 'D. Data drive more than half full, with and without -StagingPath' -ForegroundColor Cyan
     $rp = Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType }
     New-FakeState '' $diskNo ([int]$rp.PartitionNumber)
+    $jTarget = $dL + ':\ezmv-stage-target'
+    New-Item -ItemType Directory -Path $jTarget | Out-Null
+    $jLink = Join-Path $WorkDir 'staging-link'
+    & cmd.exe /c mklink /J $jLink $jTarget | Out-Null
+    $r = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-PlanOnly', '-StagingPath', $jLink, '-StatePath', $statePath)
+    Check 'a staging folder that is a junction onto D: is refused' ($r.Code -eq 1 -and $r.Text -like '*junction*')
+    [System.IO.Directory]::Delete($jLink)
+    Remove-Item -LiteralPath $jTarget -Force
     $dSizeNow = [int64](Get-Partition -DriveLetter $dL).Size
     $bigSize = [int64](FloorMB ($dSizeNow * 0.52))
     & fsutil.exe file createnew ($dL + ':\big.bin') $bigSize | Out-Null
