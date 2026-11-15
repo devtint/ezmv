@@ -6,7 +6,7 @@ Website: https://devtint.github.io/ezmv/
 
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
-> **Status: beta (0.9.1).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
+> **Status: beta (0.10.0).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. BitLocker and Windows Recovery handling, crash recovery and the roll-back path are tested with fakes for BitLocker and Windows Recovery; they have not yet been exercised against the real ones. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
 
 ## The problem
 
@@ -43,7 +43,7 @@ step 9-10  | C: +10 GB    | D: (files)                            |   delete T:,
 - Windows 10 or 11, Windows PowerShell 5.1 (already installed)
 - A GPT disk (every UEFI PC)
 - The data drive must be NTFS and sit right after the target drive, with nothing between them except Recovery partitions
-- **The data drive must be less than about half full**, because its files have to fit on it twice for a moment
+- **The data drive must be less than about half full**, because its files have to fit on it twice for a moment. If it is fuller, use `-StagingPath` to keep the temporary copy on another NTFS drive (for example an external disk) instead
 - Administrator rights (ezmv asks Windows for them itself)
 
 ## Usage
@@ -85,6 +85,8 @@ ezmv then:
 | `-VerifyHash` | Also compare the SHA-256 of every file after each copy (slower, strongest check) |
 | `-Yes` | Answer every question with yes (unattended use and tests) |
 | `-StatePath` | Where the resume file is kept (default `%ProgramData%\ezmv\state.json`) |
+| `-StagingPath E:\ezmv-staging` | Keep the temporary copy in this folder on another NTFS drive instead of on a temporary partition. Lifts the half-full limit |
+| `-NoRecoveryPartition` | Do not create a new recovery partition; keep Windows Recovery on the Windows drive |
 
 ## What it detects and handles for you
 
@@ -96,14 +98,16 @@ ezmv then:
 | BitLocker on for the data drive | Works, but warns that the recreated drive is not encrypted until you turn it on again |
 | BitLocker still encrypting / decrypting | Stops and asks you to wait |
 | Data drive locked by BitLocker | Stops and asks you to unlock it |
-| Windows Recovery lives on the partition being removed | Disables it first (moves the image to the Windows drive), re-enables it at the end (after a crash, the next run re-enables it) |
+| Windows Recovery lives on the partition being removed | Disables it first, creates a new hidden recovery partition (at least 1 GB, right after the target drive, as Microsoft recommends) and moves Windows Recovery onto it. After a crash, the next run finishes this |
 | No Recovery partition between the drives | Skips that step |
 | Something other than a Recovery partition between the drives | Stops |
 | Page file on the data drive | Stops and tells you how to move it |
 | Programs running from the data drive | Lists them and waits until you close them |
 | Laptop on battery | Warns and asks |
 | Data drive needs a disk check | Stops and tells you to run `chkdsk` |
-| Data drive too full, or cannot shrink far enough | Stops before changing anything |
+| Data drive too full, or cannot shrink far enough | Stops before changing anything and suggests `-StagingPath` |
+| Staging drive not NTFS, too small, or the folder not empty | Stops before changing anything |
+| Staging drive unplugged after the old data drive was deleted | Stops and asks you to plug it back in |
 | Unallocated space already on the disk | Stops (extend into it first) |
 | Folder links (junctions) on the data drive | Lists them; they are not recreated |
 | Script stored on the data drive | Stops and asks you to move it |
@@ -128,7 +132,7 @@ The temporary drive is labelled `ezmv-temp`, so it is easy to tell apart from th
 - The data drive's Recycle Bin contents
 - Folder links (junctions) on the data drive
 - BitLocker encryption on the data drive, until you turn it on again. During the run, files are written to drives that are not encrypted yet.
-- The Recovery partition between the two drives (Windows Recovery itself is kept and re-enabled)
+- Nothing on the Recovery partition between the two drives except Windows Recovery, which moves to a new hidden recovery partition
 
 ## Tests
 
@@ -154,7 +158,7 @@ The virtual-disk test never selects your real disks: it creates a `.vhd` file in
 
 - GPT disks and NTFS data drives only
 - The data drive must be the next lettered drive to the right of the target, on the same disk
-- Needs the data drive to be under roughly half full
+- Needs the data drive to be under roughly half full, unless `-StagingPath` points to another drive with enough free space
 - Not for dynamic disks or Storage Spaces
 
 ## Disclaimer

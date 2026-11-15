@@ -69,12 +69,12 @@ jobs:
       - name: Run tests\Test-Resilience.ps1
         shell: powershell
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Resilience.ps1 -WorkDir "$env:RUNNER_TEMP\ezmv-resilience-test" -KeepDisk
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Resilience.ps1 -WorkDir "C:\ezmv-resilience-test" -KeepDisk
           exit $LASTEXITCODE
       - name: Upload ezmv logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ezmv-resilience-logs
-          path: ${{ runner.temp }}/ezmv-resilience-test/state/logs
+          path: C:/ezmv-resilience-test/state/logs
           if-no-files-found: ignore

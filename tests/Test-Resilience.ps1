@@ -15,8 +15,11 @@
       B. Killed after step 3 with BitLocker on, then rolled back: BitLocker must
          be resumed and the disk must be as before.
       C. Killed after step 5 with BitLocker on and Windows Recovery on the
-         partition being removed: the resumed run must finish, resume BitLocker
-         and re-enable Windows Recovery.
+         partition being removed: the resumed run must finish, resume BitLocker,
+         create a hidden recovery partition right after the target and move
+         Windows Recovery onto it.
+      D. Data drive more than half full: refused without -StagingPath, and
+         done with it (killed after step 5 and resumed).
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\tests\Test-Resilience.ps1
@@ -72,6 +75,27 @@ function New-FakeState([string]$BitLockerLetter, [int]$WinReDisk, [int]$WinRePar
 }
 function Get-FakeState { Get-Content -LiteralPath $fakePath -Raw | ConvertFrom-Json }
 
+# The recovery partition ezmv creates must sit right after the target, be
+# hidden, at least 1 GB, hold Windows Recovery, and be followed by the data drive.
+function Test-NewRecovery([string]$Tag) {
+    $t = Get-Partition -DriveLetter $tL
+    $recs = @(Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType })
+    Check ($Tag + ': exactly one recovery partition') ($recs.Count -eq 1)
+    if ($recs.Count -ne 1) { return }
+    $rec = $recs[0]
+    $tEnd = [int64]$t.Offset + [int64]$t.Size
+    Check ($Tag + ': it sits right after the target') (([int64]$rec.Offset - $tEnd) -ge 0 -and ([int64]$rec.Offset - $tEnd) -lt 1MB)
+    Check ($Tag + ': it is at least 1 GB') ([int64]$rec.Size -ge 1GB)
+    Check ($Tag + ': it is hidden (no drive letter, none assigned later)') ((-not (Get-Letter $rec)) -and [bool]$rec.NoDefaultDriveLetter)
+    $fs = ''
+    try { $fs = "$((Get-Volume -Partition $rec -ErrorAction Stop).FileSystem)" } catch { }
+    Check ($Tag + ': it is formatted NTFS') ($fs -eq 'NTFS')
+    $f = Get-FakeState
+    Check ($Tag + ': Windows Recovery is enabled on it') ($f.WinReEnabled -and [int]$f.WinReDisk -eq $diskNo -and [int]$f.WinRePartition -eq [int]$rec.PartitionNumber)
+    $d = Get-Partition -DriveLetter $dL
+    Check ($Tag + ': the data drive follows it') (([int64]$d.Offset - ([int64]$rec.Offset + [int64]$rec.Size)) -lt 1MB -and [int64]$d.Offset -gt [int64]$rec.Offset)
+}
+
 function Get-Manifest([string]$Letter) {
     $m = @{}
     $tree = Get-Tree ($Letter + ':\')
@@ -121,7 +145,7 @@ try {
     Write-Host ''
     Write-Host 'Building the virtual disk' -ForegroundColor Cyan
     $dp = Join-Path $WorkDir 'create.txt'
-    Set-Content -Path $dp -Encoding ASCII -Value ('create vdisk file="' + $vhd + '" maximum=6144 type=expandable')
+    Set-Content -Path $dp -Encoding ASCII -Value ('create vdisk file="' + $vhd + '" maximum=10240 type=expandable')
     & diskpart.exe /s $dp | Out-Null
     if (-not (Test-Path $vhd)) { throw 'diskpart could not create the virtual disk.' }
     Mount-DiskImage -ImagePath $vhd -NoDriveLetter | Out-Null
@@ -191,8 +215,42 @@ try {
     Check 'BitLocker was suspended only once' (@(@($f.Calls) | Where-Object { $_ -like 'Suspend-BitLocker*' }).Count -eq 1)
     Check 'resume file was removed' (-not (Test-Path $statePath))
     Check 'target grew by 1 GB' ([math]::Abs([int64](Get-Partition -DriveLetter $tL).Size - $targetBefore - 1GB) -le 1MB)
-    Check 'recovery partition was removed' (@(Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType }).Count -eq 0)
     Check 'files on the data drive are unchanged' (Test-Manifest $manifest $dL)
+    Test-NewRecovery 'C'
+
+    # ------------------------------------------------------------------ D --
+    Write-Host ''
+    Write-Host 'D. Data drive more than half full, with and without -StagingPath' -ForegroundColor Cyan
+    $rp = Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType }
+    New-FakeState '' $diskNo ([int]$rp.PartitionNumber)
+    $dSizeNow = [int64](Get-Partition -DriveLetter $dL).Size
+    $bigSize = [int64](FloorMB ($dSizeNow * 0.52))
+    & fsutil.exe file createnew ($dL + ':\big.bin') $bigSize | Out-Null
+    Write-Host ('  ' + $dL + ': is now ' + [int](100 * (Get-UsedBytes $dL) / $dSizeNow) + '% full')
+    $manifest = Get-Manifest $dL
+    $targetBefore = [int64](Get-Partition -DriveLetter $tL).Size
+
+    $r = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-PlanOnly', '-StatePath', $statePath)
+    Check 'without -StagingPath ezmv refuses (files would not fit twice)' ($r.Code -eq 1 -and $r.Text -like '*-StagingPath*')
+
+    $stg = Join-Path $WorkDir 'staging'
+    $null = Invoke-Ezmv @('-Target', $tL, '-GiveGB', '1', '-Yes', '-StagingPath', $stg, '-StatePath', $statePath, '-KillAfterPhase', '5')
+    $mid = Read-State $statePath
+    Update-HostStorageCache
+    Check 'killed run left the resume file at step 5' ($mid -and [int]$mid.Phase -eq 5)
+    Check 'resume file remembers the staging folder' ($mid -and "$($mid.StagingPath)" -eq $stg)
+    Check 'data drive is gone, files are in the staging folder' ((-not (Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue)) -and (Test-Path (Join-Path $stg 'big.bin')))
+    Check 'staging folder is not hidden' (((Get-Item -LiteralPath $stg -Force).Attributes -band [System.IO.FileAttributes]::Hidden) -eq 0)
+
+    $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
+    Update-HostStorageCache
+    Check 'resumed run exits cleanly' ($r.Code -eq 0)
+    Check 'resume file was removed' (-not (Test-Path $statePath))
+    Check 'staging folder was deleted' (-not (Test-Path -LiteralPath $stg))
+    Check 'target grew by 1 GB' ([math]::Abs([int64](Get-Partition -DriveLetter $tL).Size - $targetBefore - 1GB) -le 1MB)
+    Check 'files on the data drive are unchanged' (Test-Manifest $manifest $dL)
+    Check 'no unallocated space left' ([int64](Get-Disk -Number $diskNo).LargestFreeExtent -le 16MB)
+    Test-NewRecovery 'D'
 }
 catch {
     Write-Host ('TEST ERROR: ' + $_.Exception.Message) -ForegroundColor Red

@@ -53,7 +53,15 @@ function global:Invoke-FakeReAgentC {
             }
         }
         '/disable' { $s.WinReEnabled = $false; Write-FakeState $s; Add-FakeCall 'reagentc /disable'; 'REAGENTC.EXE: Operation Successful.' }
-        '/enable'  { $s.WinReEnabled = $true;  Write-FakeState $s; Add-FakeCall 'reagentc /enable';  'REAGENTC.EXE: Operation Successful.' }
+        '/enable'  {
+            # like the real one: the image goes to a recovery partition on the
+            # disk if there is one (otherwise it stays where it was)
+            $rec = @(Get-Partition -DiskNumber $s.WinReDisk -ErrorAction SilentlyContinue |
+                Where-Object { "$($_.GptType)".ToLower() -eq '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}' } |
+                Sort-Object Offset | Select-Object -First 1)
+            if ($rec.Count -gt 0) { $s.WinRePartition = [int]$rec[0].PartitionNumber }
+            $s.WinReEnabled = $true; Write-FakeState $s; Add-FakeCall 'reagentc /enable'; 'REAGENTC.EXE: Operation Successful.'
+        }
         default    { throw ('fake reagentc: unexpected arguments ' + ($args -join ' ')) }
     }
 }
