@@ -633,10 +633,21 @@ function Undo-Early($State) {
         $lo = [int64]$State.DonorOffset + [int64]$State.DonorShrunk - 1MB
         $hi = [int64]$State.DonorOffset + [int64]$State.DonorSize
         foreach ($tp in @(Get-Layout $diskNo | Where-Object { [int64]$_.Offset -ge $lo -and [int64]$_.Offset -lt $hi })) {
-            $l = Get-Letter $tp
-            if ((-not $l) -or $l -eq "$($State.TempLetter)") {
-                Remove-PartitionAtOffset $diskNo ([int64]$tp.Offset)
+            # Only a partition that is provably ezmv's is removed: the saved
+            # GUID, or (if the run died before saving it) one that is still
+            # unformatted or labelled as the temporary drive.
+            $ours = $false
+            if ("$($State.TempGuid)") {
+                $ours = ((Get-PartGuid $tp) -eq "$($State.TempGuid)".ToLower())
+            } else {
+                $vol = $null
+                try { $vol = Get-Volume -Partition $tp -ErrorAction Stop } catch { }
+                $ours = ((-not $vol) -or (-not "$($vol.FileSystem)") -or "$($vol.FileSystemLabel)" -eq $TempLabel)
             }
+            if (-not $ours) {
+                throw ('Roll-back stopped: partition ' + $tp.PartitionNumber + ' in the space taken from ' + $State.DonorLetter + ': is not the temporary drive ezmv created, so it was left alone. Your files are on ' + $State.DonorLetter + ':.')
+            }
+            Remove-PartitionAtOffset $diskNo ([int64]$tp.Offset) ([string]$State.TempGuid)
         }
     }
     Update-HostStorageCache
@@ -758,6 +769,10 @@ try {
         if ($bitLockerSuspended -or $winReDisabled) {
             Step 'Finishing the clean-up of the last run'
             $S = $saved
+            return
+        }
+        if ($PlanOnly) {
+            Say '  The last run finished its disk work. PLAN ONLY mode: its resume file is left as it is.' 'Yellow'
             return
         }
         Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
@@ -1262,7 +1277,8 @@ try {
 
     # After step 3 the files may only exist in the staging folder: make sure
     # its drive is plugged in before going on.
-    if ($stg -and [int]$S.Phase -ge 3 -and [int]$S.Phase -lt 9 -and -not (Test-Path -LiteralPath $stg)) {
+    $onlyCopy = (([int]$S.Phase -ge 4 -and [int]$S.Phase -lt 8) -or ([int]$S.Phase -eq 3 -and [bool]$S.DonorDeleting))
+    if ($stg -and $onlyCopy -and -not (Test-Path -LiteralPath $stg)) {
         throw ('The staging folder ' + $stg + ' is not reachable. Plug its drive back in (with the same letter), then start ezmv again.')
     }
     # If an earlier run suspended BitLocker or disabled Windows Recovery and then
@@ -1387,6 +1403,17 @@ try {
         $old = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -eq [int64]$S.DonorOffset }
         if ($old) {
             if ((Get-Letter $old) -ne $dL) { throw ('The partition at the old position of ' + $dL + ': is not ' + $dL + ': any more. Stopping to be safe.') }
+            # Both sides of the final sync must be the partitions ezmv recorded:
+            # the sync mirrors, so a wrong source or target would lose files.
+            if ("$($S.DonorGuid)" -and (Get-PartGuid $old) -ne "$($S.DonorGuid)".ToLower()) {
+                throw ('The partition at the old position of ' + $dL + ': is not the original ' + $dL + ': (its GUID changed). Nothing was copied or deleted. Your files are on ' + $copyName + '.')
+            }
+            if (-not $stg) {
+                $tNow = Get-Partition -DriveLetter $tL -ErrorAction SilentlyContinue
+                $tOk = ($tNow -and [int]$tNow.DiskNumber -eq $diskNo -and [int64]$tNow.Offset -eq [int64]$S.TempOffset)
+                if ($tOk -and "$($S.TempGuid)" -and (Get-PartGuid $tNow) -ne "$($S.TempGuid)".ToLower()) { $tOk = $false }
+                if (-not $tOk) { throw ($tL + ': is not the temporary drive ezmv created. Nothing was copied or deleted. Give the temporary drive its letter ' + $tL + ': back, then start ezmv again.') }
+            }
             if (-not [bool]$S.DonorDeleting) {
                 Say ''
                 Say ('POINT OF NO RETURN: the old ' + $dL + ': will now be deleted. Your files will live only on ' + $copyName + ' until they are copied back.') 'Yellow'

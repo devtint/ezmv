@@ -221,6 +221,17 @@ try {
     $mid = Read-State $statePath
     Check 'killed run left the resume file at step 3' ($mid -and [int]$mid.Phase -eq 3)
     $tmpL = "$($mid.TempLetter)"
+
+    # T: moved to another letter while paused: the final sync must not run
+    $spare = $null
+    foreach ($c in 'U', 'V', 'W', 'X', 'Y', 'Q', 'P', 'O') { if (-not (Get-Volume -DriveLetter $c -ErrorAction SilentlyContinue)) { $spare = $c; break } }
+    Set-Partition -DriveLetter $tmpL -NewDriveLetter $spare
+    $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
+    Update-HostStorageCache
+    Check 'a temporary drive under another letter stops the run before any sync' ($r.Code -eq 1 -and $r.Text -like '*is not the temporary drive*')
+    Check 'nothing was deleted' ([bool](Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue) -and [int](Read-State $statePath).Phase -eq 3)
+    Set-Partition -DriveLetter $spare -NewDriveLetter $tmpL
+
     Set-Content -Path ($dL + ':\docs\late.txt') -Value 'written after the copy was checked' -Encoding ASCII
     $manifest = Get-Manifest $dL
 
@@ -235,6 +246,16 @@ try {
     Update-HostStorageCache
     Check 'roll-back is not offered after the deletion' ($r.Text -like '*past the point*' -and $r.Text -notlike '*Roll back instead*')
     Check 'the temporary drive still holds the files' (Test-Path ($tmpL + ':\docs\late.txt'))
+
+    # an empty new partition put where D: was must not become the sync source
+    $fake = New-Partition -DiskNumber $diskNo -Offset ([int64]$mid.DonorOffset) -Size 512MB -DriveLetter $dL
+    Format-Volume -Partition $fake -FileSystem NTFS -NewFileSystemLabel 'IMPOSTOR' -Confirm:$false | Out-Null
+    $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
+    Update-HostStorageCache
+    Check 'a replacement partition at the old place of D: is refused' ($r.Code -eq 1 -and $r.Text -like '*is not the original*')
+    Check 'the copy on the temporary drive is untouched' (Test-Path ($tmpL + ':\docs\late.txt'))
+    Remove-Partition -DiskNumber $diskNo -PartitionNumber (Get-Partition -DriveLetter $dL).PartitionNumber -Confirm:$false
+    Update-HostStorageCache
 
     $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
     Update-HostStorageCache
@@ -276,6 +297,8 @@ try {
     $null = Invoke-Ezmv @('-Yes', '-StatePath', $statePath, '-KillAfterPhase', '10')
     $mid = Read-State $statePath
     Check 'killed after step 10 with BitLocker still suspended' ($mid -and [int]$mid.Phase -eq 10 -and [bool]$mid.BitLockerSuspended -and -not (Get-FakeState).BitLockerOn)
+    $null = Invoke-Ezmv @('-PlanOnly', '-StatePath', $statePath)
+    Check '-PlanOnly keeps the resume file with the pending clean-up' ((Test-Path $statePath) -and [bool](Read-State $statePath).BitLockerSuspended)
 
     $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
     $f = Get-FakeState

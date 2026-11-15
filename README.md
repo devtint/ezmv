@@ -164,6 +164,16 @@ The virtual-disk test never selects your real disks: it creates a `.vhd` file in
 - Needs the data drive to be under roughly half full, unless `-StagingPath` points to another drive with enough free space
 - Not for dynamic disks or Storage Spaces
 
+## Known limits
+
+These are known and accepted for the beta:
+
+- **A short window before D: is deleted.** A final sync and check run right before the old data drive is deleted, but a program could still write to it in the few seconds between that check and the deletion. Close everything that uses the drive.
+- **Do not rearrange disks while a run is paused.** ezmv checks partition GUIDs and refuses to act on partitions it did not record, but it is not designed for partitions or drive letters being changed by hand between runs.
+- **`-StatePath` is for tests and advanced use.** ezmv locks the folder it names to Administrators, but not the folders above it. The default location is fully protected.
+- **Size check margin.** The new data drive must hold the measured copy plus 3% and 256 MB. Alternate data streams and file system overhead are covered by that margin, not measured exactly.
+- **Windows Recovery and BitLocker are tested with fakes in CI.** Their real behaviour, including which partition `reagentc /enable` picks when there are two recovery partitions, still needs testing on real machines.
+
 ## Disclaimer
 
 This tool deletes and recreates partitions. It is provided as is, without warranty of any kind (see [LICENSE](LICENSE)). You are responsible for your backups.
