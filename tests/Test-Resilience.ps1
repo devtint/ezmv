@@ -20,6 +20,9 @@
          Windows Recovery onto it.
       D. Data drive more than half full: refused without -StagingPath, and
          done with it (killed after step 5 and resumed).
+      E. Data drive and recovery partition deleted by hand, only free space
+         after the target: -FromFreeSpace builds target | recovery | data
+         (killed after step 2 and resumed).
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\tests\Test-Resilience.ps1
@@ -257,6 +260,35 @@ try {
     Check 'files on the data drive are unchanged' (Test-Manifest $manifest $dL)
     Check 'no unallocated space left' ([int64](Get-Disk -Number $diskNo).LargestFreeExtent -le 16MB)
     Test-NewRecovery 'D'
+
+    # ------------------------------------------------------------------ E --
+    Write-Host ''
+    Write-Host 'E. Only free space after the target, -FromFreeSpace' -ForegroundColor Cyan
+    $d = Get-Partition -DriveLetter $dL
+    Remove-Partition -DiskNumber $diskNo -PartitionNumber $d.PartitionNumber -Confirm:$false
+    $rp = Get-Partition -DiskNumber $diskNo | Where-Object { "$($_.GptType)" -eq $recoveryType }
+    Remove-Partition -DiskNumber $diskNo -PartitionNumber $rp.PartitionNumber -Confirm:$false
+    Update-HostStorageCache
+    New-FakeState '' $diskNo 0
+    $f = Get-FakeState; $f.WinReEnabled = $false; $f.WinRePartition = 0
+    $f | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $fakePath -Encoding UTF8
+    $targetBefore = [int64](Get-Partition -DriveLetter $tL).Size
+
+    $r = Invoke-Ezmv @('-Target', $tL, '-Yes', '-PlanOnly', '-StatePath', $statePath)
+    Check 'normal mode stops and suggests -FromFreeSpace' ($r.Code -eq 1 -and $r.Text -like '*-FromFreeSpace*')
+
+    $null = Invoke-Ezmv @('-FromFreeSpace', '-Target', $tL, '-GiveGB', '1', '-DataLetter', $dL, '-DataLabel', 'EZMV_NEW', '-Yes', '-StatePath', $statePath, '-KillAfterPhase', '2')
+    $mid = Read-State $statePath
+    Check 'killed run left the resume file at step 2' ($mid -and [int]$mid.Phase -eq 2 -and "$($mid.Mode)" -eq 'FromFree')
+
+    $r = Invoke-Ezmv @('-Yes', '-StatePath', $statePath)
+    Update-HostStorageCache
+    Check 'resumed run exits cleanly' ($r.Code -eq 0)
+    Check 'resume file was removed' (-not (Test-Path $statePath))
+    Check 'target grew by 1 GB' ([math]::Abs([int64](Get-Partition -DriveLetter $tL).Size - $targetBefore - 1GB) -le 1MB)
+    Check 'new data drive has the chosen letter and name' ((Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue) -and (Get-Volume -DriveLetter $dL).FileSystemLabel -eq 'EZMV_NEW')
+    Check 'no unallocated space left' ([int64](Get-Disk -Number $diskNo).LargestFreeExtent -le 16MB)
+    Test-NewRecovery 'E'
 }
 catch {
     Write-Host ('TEST ERROR: ' + $_.Exception.Message) -ForegroundColor Red

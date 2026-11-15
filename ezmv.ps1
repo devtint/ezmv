@@ -49,6 +49,21 @@
     The data drive then only has to hold its files once, so it can be more
     than half full. The folder must be empty or not exist yet.
 
+.PARAMETER FromFreeSpace
+    For a disk where the space after the target drive is already free (for
+    example you deleted D: and the recovery partition yourself). ezmv asks
+    how much to add to the target, then builds:
+        target (+ your GB) | hidden recovery partition (1 GB) | new data drive
+    No files are copied. A recovery partition further along the disk (often
+    the manufacturer's) is left alone.
+
+.PARAMETER DataLetter
+    With -FromFreeSpace: drive letter for the new data drive. Default: D, or
+    the next free letter.
+
+.PARAMETER DataLabel
+    With -FromFreeSpace: name for the new data drive. Default: Data.
+
 .PARAMETER NoRecoveryPartition
     When the partition Windows Recovery lives on is removed, ezmv normally
     creates a new, hidden recovery partition (at least 1 GB) right after the
@@ -81,6 +96,9 @@ param(
     [string]$StatePath,
     [string]$StagingPath,
     [switch]$NoRecoveryPartition,
+    [switch]$FromFreeSpace,
+    [string]$DataLetter,
+    [string]$DataLabel = 'Data',
     [int]$StopAfterPhase = 0,
     [int]$KillAfterPhase = 0
 )
@@ -508,6 +526,10 @@ function Read-State([string]$Path) {
 
 function Get-StateText($State) {
     if (-not $State) { return 'Nothing on the disk was changed.' }
+    if ("$($State.Mode)" -eq 'FromFree') {
+        if ([int]$State.Phase -ge 10) { return 'The disk work is complete.' }
+        return ('Step ' + $State.Phase + ' of 3 finished. No files are involved. Start ezmv again to finish the new layout.')
+    }
     $d = $State.DonorLetter + ':'
     $t = Get-CopyName $State
     $c = $State.TargetLetter + ':'
@@ -614,8 +636,13 @@ try {
     if ($saved) {
         Step 'An unfinished run was found'
         Say ('  Started:  ' + $saved.Started)
-        Say ('  Job:      give ' + (ToGB $saved.GiveBytes) + ' GB from ' + $saved.DonorLetter + ': to ' + $saved.TargetLetter + ':')
-        Say ('  Progress: step ' + $saved.Phase + ' of 10 finished')
+        if ("$($saved.Mode)" -eq 'FromFree') {
+            Say ('  Job:      add ' + (ToGB $saved.GiveBytes) + ' GB to ' + $saved.TargetLetter + ':, then recovery and ' + $saved.DonorLetter + ': in the free space')
+            Say ('  Progress: step ' + $saved.Phase + ' of 3 finished')
+        } else {
+            Say ('  Job:      give ' + (ToGB $saved.GiveBytes) + ' GB from ' + $saved.DonorLetter + ': to ' + $saved.TargetLetter + ':')
+            Say ('  Progress: step ' + $saved.Phase + ' of 10 finished')
+        }
         Say ('  State:    ' + (Get-StateText $saved)) 'Yellow'
         if ($PlanOnly) { Say ''; Say 'PLAN ONLY mode: stopping here.' 'Yellow'; return }
 
@@ -625,6 +652,9 @@ try {
 
         if (Ask-YesNo 'Continue this run?') {
             $S = $saved
+        } elseif ("$($saved.Mode)" -eq 'FromFree') {
+            Say '  Left as it is. Start ezmv again when you want to finish.' 'Yellow'
+            return
         } elseif ([int]$saved.Phase -le 3) {
             if (Ask-YesNo ('Roll back instead (remove the temporary drive and grow ' + $saved.DonorLetter + ': back)?')) {
                 Step 'Rolling back'
@@ -642,6 +672,141 @@ try {
             Say '  This run is past the point where it can be rolled back. Start ezmv again when you want to continue.' 'Yellow'
             return
         }
+    }
+
+    # ---- fresh run, -FromFreeSpace: target | free space ---------------------
+    if (-not $S -and $FromFreeSpace) {
+        Step 'Detecting the disk layout'
+        $tLetterIn = $env:SystemDrive.TrimEnd(':')
+        if ($Target) { $tLetterIn = $Target.Trim().TrimEnd(':').ToUpper() }
+        if ($tLetterIn -notmatch '^[A-Za-z]$') { throw ('"' + $Target + '" is not a drive letter.') }
+        $cPart = Get-Partition -DriveLetter $tLetterIn
+        $diskNo = [int]$cPart.DiskNumber
+        $disk = Get-Disk -Number $diskNo
+        if ($disk.PartitionStyle -ne 'GPT') { throw 'Only GPT disks are supported.' }
+        Say ('Target drive:  ' + $tLetterIn + ':  on disk ' + $diskNo + ' (' + $disk.FriendlyName + ', ' + (ToGB $disk.Size) + ' GB)')
+        Show-Layout $diskNo
+
+        $cEnd = [int64]$cPart.Offset + [int64]$cPart.Size
+        $next = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -gt [int64]$cPart.Offset } | Select-Object -First 1
+        $freeEnd = [int64]$disk.Size - 1MB
+        if ($next) { $freeEnd = [int64]$next.Offset }
+        $free = FloorMB ($freeEnd - $cEnd)
+        if ($free -lt 2GB) {
+            throw ('There is no free space right after ' + $tLetterIn + ': (' + (ToGB $free) + ' GB). -FromFreeSpace needs the space after ' + $tLetterIn + ': to be unallocated. Without it, ezmv moves space from the drive after ' + $tLetterIn + ': instead.')
+        }
+        $after = 'the end of the disk'
+        if ($next) { $after = 'partition ' + $next.PartitionNumber + ' (' + $next.Type + ', left untouched)' }
+        Say ('Free space:    ' + (ToGB $free) + ' GB right after ' + $tLetterIn + ':, up to ' + $after)
+
+        Step 'Running safety checks'
+        $cBl = $null
+        try { $cBl = Get-BitLockerVolume -MountPoint ($tLetterIn + ':') } catch { }
+        $cProtected = ($cBl -and "$($cBl.ProtectionStatus)" -eq 'On')
+        if ($cBl -and "$($cBl.VolumeStatus)" -like '*InProgress*') {
+            throw ('BitLocker is still encrypting or decrypting ' + $tLetterIn + ': (' + $cBl.VolumeStatus + '). Wait until it has finished, then run ezmv again.')
+        }
+        if ($cProtected) { Say ('  BitLocker on ' + $tLetterIn + ': is ON -> suspended during the work, resumed at the end') } else { Say '  BitLocker: nothing to suspend' }
+
+        # Windows Recovery: already healthy on a recovery partition on this disk?
+        $winRe = Get-WinReInfo
+        $reHome = $null
+        if ($winRe.Enabled -and $winRe.Disk -eq $diskNo) {
+            $reHome = Get-Layout $diskNo | Where-Object { [int]$_.PartitionNumber -eq $winRe.Partition -and "$($_.GptType)".ToLower() -eq $RecoveryGptType }
+        }
+        $recreate = $false
+        $recSize = [int64]0
+        if ($NoRecoveryPartition) {
+            Say '  recovery partition: skipped (-NoRecoveryPartition)'
+        } elseif ($reHome) {
+            Say ('  Windows Recovery already lives on recovery partition ' + $reHome.PartitionNumber + ', which is healthy. No new one is needed.')
+        } else {
+            $recreate = $true
+            $recSize = [int64]$RecoveryMinSize
+            Say ('  a new hidden recovery partition (' + (ToGB $recSize) + ' GB) will be created right after ' + $tLetterIn + ':, and Windows Recovery moved onto it')
+            if (-not $winRe.Enabled -and -not (Test-Path (Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'))) {
+                Say '  The Windows Recovery image (Winre.wim) was not found on the Windows drive, so Recovery may not turn on. The partition is created anyway.' 'Yellow'
+            }
+        }
+
+        if ($DataLetter) {
+            $newLetter = $DataLetter.Trim().TrimEnd(':').ToUpper()
+            if ($newLetter -notmatch '^[A-Z]$') { throw ('"' + $DataLetter + '" is not a drive letter.') }
+        } else {
+            $usedLetters = @(Get-Volume | ForEach-Object { "$($_.DriveLetter)".Trim([char]0).Trim() } | Where-Object { $_ })
+            $usedLetters += @(Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Name })
+            $newLetter = $null
+            foreach ($c in 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') {
+                if ($usedLetters -notcontains $c) { $newLetter = $c; break }
+            }
+            if (-not $newLetter) { throw 'No free drive letter is available for the new data drive.' }
+        }
+        if (Get-Partition -DriveLetter $newLetter -ErrorAction SilentlyContinue) { throw ('Drive letter ' + $newLetter + ': is already in use. Choose another with -DataLetter.') }
+
+        $maxGive = [int][math]::Floor(($free - $recSize - 1GB) / 1GB)
+        if ($maxGive -lt 0) { throw 'The free space is too small for a recovery partition and a data drive.' }
+
+        Step 'Your choices'
+        $give = $GiveGB
+        if ($give -lt 0 -or $give -gt $maxGive) { throw ('-GiveGB must be between 0 and ' + $maxGive + '.') }
+        if (-not $Yes -and -not $PSBoundParameters.ContainsKey('GiveGB') -and -not $PlanOnly) {
+            $give = -1
+            while ($give -lt 0 -or $give -gt $maxGive) {
+                $raw = (Read-Host ('How many GB to add to ' + $tLetterIn + ':? (0-' + $maxGive + ') [0]')).Trim()
+                if (-not $raw) { $give = 0; break }
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n)) { $give = $n }
+            }
+        }
+        $giveBytes = [int64]$give * 1GB
+        $dataSize = $free - $giveBytes - $recSize
+
+        Step 'Plan'
+        if ($give -gt 0) { Say ('   1. Extend ' + $tLetterIn + ': from ' + (ToGB $cPart.Size) + ' GB to ' + (ToGB ([int64]$cPart.Size + $giveBytes)) + ' GB') } else { Say ('   1. (' + $tLetterIn + ': stays ' + (ToGB $cPart.Size) + ' GB)') }
+        if ($recreate) { Say ('   2. Create a hidden recovery partition (' + (ToGB $recSize) + ' GB) and move Windows Recovery onto it') } else { Say '   2. (no new recovery partition)' }
+        Say ('   3. Create ' + $newLetter + ': "' + $DataLabel + '" with the rest, about ' + (ToGB $dataSize) + ' GB')
+        Say ''
+        $resText = '  Result:  ' + $tLetterIn + ': ' + (ToGB ([int64]$cPart.Size + $giveBytes)) + ' GB'
+        if ($recreate) { $resText += ' | Recovery ' + (ToGB $recSize) + ' GB (hidden)' }
+        $resText += ' | ' + $newLetter + ': about ' + (ToGB $dataSize) + ' GB'
+        Say $resText 'Green'
+
+        if ($PlanOnly) { Say ''; Say 'PLAN ONLY mode: stopping here. Nothing was changed.' 'Yellow'; return }
+
+        Step 'Before you confirm'
+        if ($cProtected) {
+            Say ('  - Save your BitLocker recovery key:  manage-bde -protectors -get ' + $tLetterIn + ':')
+            if (-not (Ask-YesNo 'Do you have your BitLocker recovery key saved somewhere safe?')) { throw 'Stopped: save the recovery key first.' }
+        }
+        if (-not (Ask-Word 'Ready to change the disk.' 'YES')) { throw 'Stopped by you.' }
+
+        $S = [pscustomobject]@{
+            Version        = $EzmvVersion
+            Mode           = 'FromFree'
+            Started        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Phase          = 0
+            DiskNumber     = $diskNo
+            DiskGuid       = "$($disk.Guid)"
+            TargetLetter   = $tLetterIn
+            TargetOrigSize = [int64]$cPart.Size
+            DonorLetter    = $newLetter
+            DonorLabel     = $DataLabel
+            DonorEncrypted = $false
+            FreeEnd        = [int64]$freeEnd
+            AllocUnit      = [int64]0
+            Used           = [int64]0
+            GiveBytes      = $giveBytes
+            TempLetter     = ''
+            TempOffset     = [int64]0
+            StagingPath    = ''
+            RecreateRecovery = [bool]$recreate
+            RecoverySize   = [int64]$recSize
+            RecoveryOffset = [int64]0
+            VerifyHash     = $false
+            BitLockerSuspended = $false
+            WinReDisabled  = $false
+        }
+        Save-State $S $StatePath
     }
 
     # ---- fresh run: detect, check, ask ------------------------------------
@@ -665,7 +830,7 @@ try {
             if ((Get-Letter $p) -and $p.Type -eq 'Basic') { $donor = $p; break }
             $between += $p
         }
-        if (-not $donor) { throw ('No data drive with a letter was found after ' + $tLetterIn + ': on the same disk.') }
+        if (-not $donor) { throw ('No data drive with a letter was found after ' + $tLetterIn + ': on the same disk. If the space after ' + $tLetterIn + ': is free, run ezmv with -FromFreeSpace.') }
         $dLetter = Get-Letter $donor
 
         foreach ($p in $between) {
@@ -702,7 +867,7 @@ try {
         }
 
         if ([int64]$disk.LargestFreeExtent -gt 64MB) {
-            throw ('The disk already has ' + (ToGB $disk.LargestFreeExtent) + ' GB of unallocated space. Extend a drive into it (or remove it) first, then run ezmv again.')
+            throw ('The disk already has ' + (ToGB $disk.LargestFreeExtent) + ' GB of unallocated space. If it is right after ' + $tLetterIn + ':, run ezmv with -FromFreeSpace to split it into ' + $tLetterIn + ':, a recovery partition and a data drive. Otherwise extend a drive into it first.')
         }
 
         if ($wmiVol -and $wmiVol.DirtyBitSet -eq $true) {
@@ -962,6 +1127,51 @@ try {
         Save-State $S $StatePath
         $bitLockerSuspended = $true
         Suspend-BitLocker -MountPoint ($cL + ':') -RebootCount 0 | Out-Null
+    }
+
+    # ---- -FromFreeSpace: 3 steps, then skip the normal 10 -------------------
+    if ("$($S.Mode)" -eq 'FromFree') {
+        if ([int]$S.Phase -lt 1) {
+            Step ('Step 1/3: extending ' + $cL + ':')
+            Update-HostStorageCache
+            $wanted = [int64]$S.TargetOrigSize + [int64]$S.GiveBytes
+            if ([int64](Get-Partition -DriveLetter $cL).Size -lt ($wanted - 1MB)) { Resize-Partition -DriveLetter $cL -Size $wanted }
+            Say ('  ' + $cL + ': is now ' + (ToGB (Get-Partition -DriveLetter $cL).Size) + ' GB') 'Green'
+            Complete-Phase 1
+        }
+        $cNow = Get-Partition -DriveLetter $cL
+        $dMinOffset = [int64]$cNow.Offset + [int64]$cNow.Size
+        if ([int]$S.Phase -lt 2) {
+            if ([bool]$S.RecreateRecovery) {
+                Step ('Step 2/3: creating a hidden recovery partition after ' + $cL + ':')
+                if ([int64]$S.RecoveryOffset -le 0) {
+                    $S.RecoveryOffset = [int64](CeilMB $dMinOffset)
+                    Save-State $S $StatePath
+                }
+                $rec = New-RecoveryPartition $diskNo ([int64]$S.RecoveryOffset) ([int64]$S.RecoverySize)
+                Say ('  recovery partition ' + $rec.PartitionNumber + ' (' + (ToGB $rec.Size) + ' GB) is ready') 'Green'
+                # disable now (if on) and enable at the end, so Windows Recovery
+                # is placed on the new partition
+                $S.WinReDisabled = $true
+                Save-State $S $StatePath
+                $winReDisabled = $true
+                if ((Get-WinReInfo).Enabled) { & reagentc.exe /disable | Out-Host }
+            } else {
+                Step 'Step 2/3: no new recovery partition'
+            }
+            Complete-Phase 2
+        }
+        if ([bool]$S.RecreateRecovery -and [int64]$S.RecoveryOffset -gt 0) {
+            $rec = Get-Layout $diskNo | Where-Object { [int64]$_.Offset -eq [int64]$S.RecoveryOffset }
+            if ($rec) { $dMinOffset = [int64]$rec.Offset + [int64]$rec.Size }
+        }
+        if ([int]$S.Phase -lt 3) {
+            Step ('Step 3/3: creating ' + $dL + ': "' + $S.DonorLabel + '"')
+            $null = New-DataDrive $diskNo $dL $S.DonorLabel 0 $dMinOffset ([int64]$S.FreeEnd)
+            Say ('  ' + $dL + ': is ' + (ToGB (Get-Partition -DriveLetter $dL).Size) + ' GB') 'Green'
+            Complete-Phase 3
+        }
+        Complete-Phase 10
     }
 
     if ([int]$S.Phase -lt 1) {

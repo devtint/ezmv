@@ -86,6 +86,8 @@ ezmv then:
 | `-Yes` | Answer every question with yes (unattended use and tests) |
 | `-StatePath` | Where the resume file is kept (default `%ProgramData%\ezmv\state.json`) |
 | `-StagingPath E:\ezmv-staging` | Keep the temporary copy in this folder on another NTFS drive instead of on a temporary partition. Lifts the half-full limit |
+| `-FromFreeSpace` | The space after the target is already free (you deleted D: and Recovery yourself). Asks how much to add to the target, then builds target, a hidden 1 GB recovery partition, and a new data drive with the rest. No files are copied |
+| `-DataLetter E` / `-DataLabel Data` | With `-FromFreeSpace`: letter and name of the new data drive (default D, Data) |
 | `-NoRecoveryPartition` | Do not create a new recovery partition; keep Windows Recovery on the Windows drive |
 
 ## What it detects and handles for you
@@ -108,7 +110,8 @@ ezmv then:
 | Data drive too full, or cannot shrink far enough | Stops before changing anything and suggests `-StagingPath` |
 | Staging drive not NTFS, too small, or the folder not empty | Stops before changing anything |
 | Staging drive unplugged after the old data drive was deleted | Stops and asks you to plug it back in |
-| Unallocated space already on the disk | Stops (extend into it first) |
+| Unallocated space already on the disk | Stops and suggests `-FromFreeSpace` when the space is right after the target |
+| Windows Recovery already healthy on another recovery partition (`-FromFreeSpace`) | Leaves it there and does not create a second one |
 | Folder links (junctions) on the data drive | Lists them; they are not recreated |
 | Script stored on the data drive | Stops and asks you to move it |
 
