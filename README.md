@@ -1,5 +1,7 @@
 # ezmv
 
+[![CI](https://github.com/devtint/ezmv/actions/workflows/ci.yml/badge.svg)](https://github.com/devtint/ezmv/actions/workflows/ci.yml)
+
 Give free space from `D:` to `C:` on Windows when Disk Management says you can't, using only built-in Windows tools and keeping your files.
 
 > **Status: beta (0.9.1).** Both tests in this repo pass on Windows 11: the file-handling test, and a full end-to-end run on a virtual disk that is interrupted at the worst moment and then resumed. Not yet exercised by a test: suspending and resuming BitLocker, moving Windows Recovery, and the roll-back path. It has not been proven on a wide range of real machines, so back up anything you cannot afford to lose and try `-PlanOnly` first.
@@ -136,6 +138,8 @@ powershell -ExecutionPolicy Bypass -File .\tests\Test-Functions.ps1
 # including an interruption at the worst moment and a resume
 powershell -ExecutionPolicy Bypass -File .\tests\Test-OnVirtualDisk.ps1
 ```
+
+Both tests also run on every push and pull request on GitHub's Windows runners (see the CI badge above). Releases are built from tags like `v0.9.1` and come with a SHA-256 checksum file.
 
 The virtual-disk test never selects your real disks: it creates a `.vhd` file in your temp folder, points ezmv at it with `-Target`, compares the SHA-256 of every file afterwards, then removes the virtual disk.
 

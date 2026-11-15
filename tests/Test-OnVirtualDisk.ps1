@@ -108,6 +108,7 @@ try {
     $mid = Read-State $statePath
     Check 'interrupted run exits with an error code' ($code1 -eq 1)
     Check 'resume file says step 5' ($mid -and [int]$mid.Phase -eq 5)
+    Check 'resume file is owned by Administrators' (Test-TrustedOwner $statePath)
     Update-HostStorageCache
     Check 'data drive is gone at this point' (-not (Get-Partition -DriveLetter $dL -ErrorAction SilentlyContinue))
     Check 'temporary drive holds the files' ($mid -and (Test-Path ($mid.TempLetter + ':\docs\readme.txt')))

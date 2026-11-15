@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (PSScriptAnalyzer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run PSScriptAnalyzer
+        shell: powershell
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          }
+          $all = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error, Warning
+          $all | Format-Table Severity, ScriptName, Line, RuleName, Message -AutoSize -Wrap
+          $errors = @($all | Where-Object Severity -eq 'Error')
+          if ($errors.Count -gt 0) { Write-Error ("$($errors.Count) error(s) found"); exit 1 }
+
+  test-functions:
+    name: File-handling tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests\Test-Functions.ps1
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Functions.ps1
+          exit $LASTEXITCODE
+
+  test-vhd:
+    name: End-to-end test on a virtual disk
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests\Test-OnVirtualDisk.ps1
+        shell: powershell
+        run: |
+          # -KeepDisk keeps the work folder so the logs can be uploaded; the
+          # runner is thrown away afterwards anyway.
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-OnVirtualDisk.ps1 -WorkDir "$env:RUNNER_TEMP\ezmv-vhd-test" -KeepDisk
+          exit $LASTEXITCODE
+      - name: Upload ezmv logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ezmv-vhd-logs
+          path: ${{ runner.temp }}/ezmv-vhd-test/state/logs
+          if-no-files-found: ignore
